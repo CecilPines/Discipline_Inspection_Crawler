@@ -1,0 +1,97 @@
+# 输出根目录（可在命令行用 --output-dir 覆盖）
+output_dir: "./data/regulations"
+
+# 爬虫
+crawl:
+  # 中纪检抓取方式：
+  #   id_walk  = 按详情页编号 law_display/<N> 逐个访问（默认，不依赖类目翻页，规避翻页触发的拦截）
+  #   category = 按左侧导航逐个子分类翻页抓取（旧方式，测试模式有固定值时仍会用它）
+  crawl_mode: "id_walk"
+  # id_walk 方式扫描到哪个编号为止（实测最后一份法规约为 71069）
+  id_walk_max: 71069
+  # 日常增量：新发布的法规编号一定更大，每天从上次扫到的编号往后探测这么多个编号
+  # （400 个约 20 分钟，足够覆盖一天的新增内容）。
+  id_walk_daily_span: 400
+  # 连续多少个「输入有误」空号后提前结束本轮探测；0 = 不提前结束（推荐）
+  id_walk_invalid_streak_stop: 0
+  # 每条之间的间隔（秒）：在 min~max 之间随机取值，避免固定节奏被站点识别
+  # 中纪检（有反爬）
+  request_delay_min_seconds: 2.0
+  request_delay_max_seconds: 5.0
+  # 校纪检（无可见反爬），可以短一些
+  bit_request_delay_min_seconds: 0.5
+  bit_request_delay_max_seconds: 0.8
+  # 中纪检每「导出一条详情页」之后再额外歇 1~2 秒（不含上面的每条间隔）
+  detail_page_delay_min_seconds: 1.0
+  detail_page_delay_max_seconds: 8.0
+  # 中纪检出现「您的请求过于频繁」限流页时的退避等待（单位：分钟，逐轮生效）
+  # 第 1 次等久一点让站点限流窗口过去；之后多半只是瞬时抖动，短等即可
+  throttle_wait_ranges:
+    - [10, 11]
+    - [2, 3]
+    - [1, 2]
+  # 连续退避次数上限（默认等于上面区间的条数）：
+  # 连续 3 次仍被限流则报错并暂停本轮爬取，未完成的分类交给定时重试。
+  # 中途一旦成功（取到列表/导出成功）计数归零，所以「每 20~30 条限流一次」时每次都有 3 次机会。
+  # 0 = 不限次数（不推荐）
+  throttle_max_rounds: 3
+  # 中断后重启的续爬时间窗（小时）：上一轮被 Ctrl+C / 终止打断时，
+  # 在这么多小时内重启会从断掉的分类和页码接着爬（不再从头重扫）；
+  # 超过该时间窗或上一轮已完整跑完，则从头全量扫描（保证不漏掉前面新发布的文件）。
+  # 0 = 每次都从头全量扫描
+  resume_max_age_hours: 12
+  playwright_headless: true
+  page_load_timeout_ms: 120000
+  # 有头模式下遇到人机验证时等待人工完成的秒数
+  human_verification_wait_seconds: 300
+  # 中纪检某个子分类多次尝试仍取不到列表时跳过；间隔该分钟数后自动只重爬这些子分类
+  # 0 = 不自动重试（下次完整爬取时会再试一次）
+  skipped_category_retry_minutes: 30
+  # 同一批跳过分类最多自动重试几轮（0 = 不限轮数）
+  skipped_category_retry_max_rounds: 3
+  # 中纪检与校纪检是否并行爬取（true=并行，false=依次爬取）
+  parallel_sources: true
+  # PDF 渲染缩放（1.0=原始大小；校纪检默认 0.9，避免内容超出右边界）
+  pdf_scale_ccdi: 1.0
+  pdf_scale_bit: 0.7
+  # 浏览器内核：留空=Playwright 自带 Chromium；可填 chrome / msedge
+  # 真实内核的自动化指纹更弱，遇到人机验证时建议用 chrome
+  browser_channel: "chrome"
+  # 隐藏自动化特征（navigator.webdriver 等），默认开启
+  stealth: true
+  # User-Agent 池随机轮换：每进入一个分类、每导出一条详情页都随机换一个 UA
+  # （内置 Chrome/Edge/Firefox 的 Windows UA；如需自定义，在下面列出来，留空用内置池）
+  rotate_user_agent: true
+  # user_agents:
+  #   - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+# 定时任务（24 小时制）
+schedule:
+  crawl_time: "02:00"
+  upload_time: "03:30"
+  # 留空使用服务器本地时区，或填写 IANA 时区名，如 Asia/Shanghai
+  timezone: "Asia/Shanghai"
+
+# 本地 PDF 保留满 N 天后上传至 RAGFlow
+upload:
+  # 上传方式：auto=爬取结束后按策略自动上传（默认）；manual=只在界面点「立即上传」时上传
+  mode: "auto"
+  min_age_days: 3
+  max_age_days: 4
+
+# RAGFlow（与 ragflow_kb_manager.py 中接口一致，可通过环境变量 RAGFLOW_API_KEY 覆盖）
+ragflow:
+  base_url: "http://10.1.1.126:9222/api/v1"
+  api_key: "ragflow-MwODI0Y2U4YzlkOTExZjE5N2Y3YWVkMz"
+  dataset_name_ccdi: "中纪检"
+  dataset_name_bit: "校纪检"
+  chunk_method: "laws"
+  chunk_token_num: 512
+  # 若知识库已存在，填写 ID 可跳过自动创建
+  dataset_id_ccdi: ""
+  dataset_id_bit: ""
+
+# 监控 UI
+monitor:
+  host: "0.0.0.0"
+  port: 8765

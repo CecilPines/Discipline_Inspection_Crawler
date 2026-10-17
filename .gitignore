@@ -1,0 +1,10 @@
+.venv/
+.playwright-browsers/
+.browser-profile/
+__pycache__/
+*.pyc
+.idea/
+data/
+_debug*
+_test*
+*.log
