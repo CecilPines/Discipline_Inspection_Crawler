@@ -1951,6 +1951,7 @@ def crawl_ccdi_by_id(
     detail_page_delay_seconds: float | list | tuple = (1.0, 2.0),
     max_id: int = 71069,
     start_id: int | None = None,
+    turn_back_at: int = 0,
     daily_span: int = 400,
     invalid_streak_stop: int = 0,
     stop_event: threading.Event | None = None,
@@ -2202,14 +2203,107 @@ def crawl_ccdi_by_id(
                 max_id,
             )
 
+        # ---- 双向扫描：正向扫到 turn_back_at 后，从 max_id 倒着往上补 ----
+        try:
+            turn_back_at = max(0, int(turn_back_at))
+        except (TypeError, ValueError):
+            turn_back_at = 0
+        if turn_back_at >= max_id:
+            turn_back_at = 0
+        turn_back_done = bool(record.get("turn_back_done"))
+        try:
+            back_last_id = int(record.get("back_last_id") or 0)
+        except (TypeError, ValueError):
+            back_last_id = 0
+        try:
+            forward_last_valid = int(record.get("forward_last_valid") or 0)
+        except (TypeError, ValueError):
+            forward_last_valid = 0
+        try:
+            backward_last_valid = int(record.get("backward_last_valid") or 0)
+        except (TypeError, ValueError):
+            backward_last_valid = 0
+        phase = str(record.get("phase") or "")
+        backward_mode = (
+            turn_back_at > 0
+            and not turn_back_done
+            and (last_done_id <= turn_back_at or phase == "backward")
+        )
+        direction = 1
         nid = start
+        if backward_mode and phase == "backward":
+            # 上次停在倒爬阶段：从更小的编号继续往下走
+            direction = -1
+            nid = (back_last_id - 1) if back_last_id else ceiling
+            logger.info(
+                "续跑倒爬阶段：从 %s 号继续向下（上次停在 %s 号）", nid, back_last_id
+            )
+        forward_end = turn_back_at if backward_mode else ceiling
+        hit_target = False
+
+        def note_position(position: int, *, valid: bool = False) -> None:
+            """记录正向/倒爬两套游标，以及各自遇到的最后一个有效编号。"""
+            nonlocal last_id, back_last_id, forward_last_valid, backward_last_valid
+            if direction == 1:
+                last_id = max(last_id, position)
+                if valid:
+                    forward_last_valid = max(forward_last_valid, position)
+            else:
+                back_last_id = position if not back_last_id else min(back_last_id, position)
+                if valid:
+                    # 倒着走，最后一次遇到的就是最小的有效编号
+                    backward_last_valid = position
+
+        def save_position() -> None:
+            state.set_id_walk_position(
+                "ccdi",
+                last_id,
+                scanned_max=max(scanned_max, last_id),
+                failed_ids=failed_ids,
+                last_url=last_seen_url,
+                back_last_id=back_last_id,
+                phase="backward" if direction == -1 else "forward",
+                forward_last_valid=forward_last_valid,
+                backward_last_valid=backward_last_valid,
+                turn_back_done=turn_back_done,
+            )
+
         save_every = 20
         since_save = 0
         invalid_streak = 0
         # 只有「比上次核对过的地方还靠后」的连续空号才用来提前收手，
         # 首次运行必须老实扫到 max_id，不能因为中间大段空号就停。
         streak_base = max(scanned_max, last_done_id)
-        while nid <= ceiling:
+        while True:
+            if direction == 1 and nid > forward_end:
+                if backward_mode:
+                    direction = -1
+                    nid = (back_last_id - 1) if back_last_id else ceiling
+                    logger.info(
+                        "正向已扫到 %s 号（正向最后一个有效编号 %s），"
+                        "改为从 %s 号倒着往上补",
+                        forward_end,
+                        forward_last_valid or "无",
+                        nid,
+                    )
+                    state.set_progress(
+                        "ccdi",
+                        current=done,
+                        total=total,
+                        message=(
+                            f"正向已到 {forward_end} 号，改为从 {nid} 号倒着爬…"
+                        ),
+                        extra={
+                            **_visit_extras(exporter),
+                            "forward_last_valid": forward_last_valid,
+                            "phase": "backward",
+                        },
+                    )
+                    save_position()
+                    continue
+                break
+            if direction == -1 and nid <= turn_back_at:
+                break
             if stop_event and stop_event.is_set():
                 aborted = True
                 break
@@ -2222,17 +2316,18 @@ def crawl_ccdi_by_id(
             known_entry = known_by_nid.get(nid)
             existing = known_entry[1] if known_entry else known_ok.get(key)
             if path_exists(existing):
-                last_id = nid
-                nid += 1
+                # 已登记且 PDF 还在：这一定是个有效编号
+                note_position(nid, valid=True)
+                nid += direction
                 continue
             if known_entry is not None:
                 # 沿用旧记录的主键（避免同一篇法规出现两条记录）
                 key = known_entry[0]
 
             # 之前已经核对过、确认没有内容的编号，直接跳过，不再发请求
-            if nid <= scanned_max and nid not in failed_set:
-                last_id = nid
-                nid += 1
+            if direction == 1 and nid <= scanned_max and nid not in failed_set:
+                note_position(nid)
+                nid += direction
                 continue
 
             url = CCDI_DISPLAY_URL.format(nid=nid)
@@ -2323,26 +2418,20 @@ def crawl_ccdi_by_id(
                         failed_ids.append(nid)
                         if len(failed_ids) > 200:
                             failed_set.discard(failed_ids.pop(0))
-                last_id = nid
+                note_position(nid)
                 scanned += 1
-                nid += 1
+                nid += direction
                 if delay_range[1] > 0:
                     sleep_with_stop(
                         random_delay(delay_range), stop_event, pause_event
                     )
                 since_save += 1
                 if since_save >= save_every:
-                    scanned_max = max(scanned_max, last_id)
-                    state.set_id_walk_position(
-                        "ccdi",
-                        last_id,
-                        scanned_max=scanned_max,
-                        failed_ids=failed_ids,
-                        last_url=last_seen_url,
-                    )
+                    save_position()
                     since_save = 0
                 if (
-                    not first_run
+                    direction == 1
+                    and not first_run
                     and nid > streak_base
                     and streak_stop > 0
                     and invalid_streak >= streak_stop
@@ -2384,8 +2473,8 @@ def crawl_ccdi_by_id(
                     failed_ids.append(nid)
                     if len(failed_ids) > 200:
                         failed_set.discard(failed_ids.pop(0))
-                last_id = nid
-                nid += 1
+                note_position(nid)
+                nid += direction
                 continue
             except Exception as exc:
                 if is_browser_closed_error(exc):
@@ -2396,8 +2485,8 @@ def crawl_ccdi_by_id(
                     failed_ids.append(nid)
                     if len(failed_ids) > 200:
                         failed_set.discard(failed_ids.pop(0))
-                last_id = nid
-                nid += 1
+                note_position(nid)
+                nid += direction
                 continue
             loaded += 1
 
@@ -2430,7 +2519,7 @@ def crawl_ccdi_by_id(
                 state.repoint_document(key, str(candidate.resolve()))
                 known_ok[key] = candidate
             scanned += 1
-            last_id = nid
+            note_position(nid, valid=True)
             state.set_progress(
                 "ccdi",
                 current=done,
@@ -2445,30 +2534,41 @@ def crawl_ccdi_by_id(
             )
             since_save += 1
             if since_save >= save_every:
-                scanned_max = max(scanned_max, last_id)
-                state.set_id_walk_position(
-                    "ccdi",
-                    last_id,
-                    scanned_max=scanned_max,
-                    failed_ids=failed_ids,
-                    last_url=last_seen_url,
-                )
+                save_position()
                 since_save = 0
-            nid += 1
+            # 倒爬阶段：文件数达到库总量（6444）就停，并记下此时的有效编号
+            if direction == -1 and total and done >= total:
+                hit_target = True
+                backward_last_valid = nid
+                logger.info(
+                    "倒爬在 %s 号达到库总量 %s 条，停止；倒爬最后一个有效编号 %s",
+                    nid,
+                    total,
+                    backward_last_valid,
+                )
+                save_position()
+                break
+            nid += direction
 
-        scanned_max = max(scanned_max, last_id)
-        state.set_id_walk_position(
-            "ccdi",
-            last_id,
-            scanned_max=scanned_max,
-            failed_ids=failed_ids,
-            last_url=last_seen_url,
-        )
+        if backward_mode and not aborted and not throttle_blocked:
+            # 倒爬阶段结束（不论是否达到总量），整个编号区间都算覆盖过
+            turn_back_done = True
+            last_id = max(last_id, ceiling)
+            logger.info(
+                "双向扫描结束：正向最后一个有效编号 %s，倒爬最后一个有效编号 %s"
+                "（累计已爬 %s 条%s）",
+                forward_last_valid or "无",
+                backward_last_valid or "无",
+                done,
+                "，已达到库总量" if hit_target else "",
+            )
+        save_position()
         elapsed = (time.time() - started_at) / 60.0
         logger.info(
-            "按编号爬取结束：编号 %s~%s，本次新增 %s，用时 %.1f 分钟",
+            "按编号爬取结束：正向 %s~%s / 倒爬停在 %s，本次新增 %s，用时 %.1f 分钟",
             start,
             last_id,
+            back_last_id or "—",
             new_count,
             elapsed,
         )
@@ -2508,12 +2608,22 @@ def crawl_ccdi_by_id(
 
     if throttle_blocked:
         state.set_alert(THROTTLE_ALERT_KEY, THROTTLE_ALERT_TEXT, level="error")
+    boundary = ""
+    if backward_mode:
+        boundary = (
+            f"；正向最后一个有效编号 {forward_last_valid or '无'}，"
+            f"倒爬最后一个有效编号 {backward_last_valid or '无'}"
+        )
     if aborted:
-        message = f"已终止，本次新增 {new_count} 个（编号停在 {last_id}）"
+        stop_at = back_last_id if direction == -1 else last_id
+        message = f"已终止，本次新增 {new_count} 个（停在 {stop_at or '—'} 号）{boundary}"
     elif throttle_blocked:
-        message = f"站点持续限流，本轮提前结束，新增 {new_count} 个"
+        message = f"站点持续限流，本轮提前结束，新增 {new_count} 个{boundary}"
     else:
-        message = f"完成，本次新增 {new_count} 个（编号到 {last_id}，用时 {(time.time()-started_at)/60:.0f} 分钟）"
+        message = (
+            f"完成，本次新增 {new_count} 个（累计 {done} 条，"
+            f"用时 {(time.time()-started_at)/60:.0f} 分钟）{boundary}"
+        )
         if short_categories:
             message += (
                 f"；仍有 {len(short_categories)} 个子分类条数不足（见子分类进度），"

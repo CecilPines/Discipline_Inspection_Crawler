@@ -28,7 +28,12 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from crawl_bit_jwjc_regulations import crawl_bit_jwjc_regulations
-from crawl_ccdi_regulations import crawl_ccdi_by_id, crawl_ccdi_regulations
+from crawl_ccdi_regulations import (
+    THROTTLE_ALERT_KEY,
+    THROTTLE_ALERT_TEXT,
+    crawl_ccdi_by_id,
+    crawl_ccdi_regulations,
+)
 from crawl_common import (
     DEFAULT_USER_AGENTS,
     load_config,
@@ -50,6 +55,7 @@ logger = logging.getLogger("discipline_crawler")
 
 # 中纪检被跳过的子分类的重试任务 id（由调度器执行）
 SKIPPED_RETRY_JOB_ID = "skipped_category_retry"
+THROTTLE_RETRY_JOB_ID = "ccdi_throttle_retry"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -225,6 +231,12 @@ def run_crawl_jobs(
             except (TypeError, ValueError):
                 daily_span = 400
             try:
+                turn_back_at = int(
+                    crawl_cfg.get("id_walk_turn_back_at", 0) or 0
+                )
+            except (TypeError, ValueError):
+                turn_back_at = 0
+            try:
                 streak_stop = int(
                     crawl_cfg.get("id_walk_invalid_streak_stop", 0) or 0
                 )
@@ -238,6 +250,7 @@ def run_crawl_jobs(
                 request_delay_seconds=delay_range,
                 detail_page_delay_seconds=detail_delay_range,
                 max_id=id_walk_max,
+                turn_back_at=turn_back_at,
                 daily_span=daily_span,
                 invalid_streak_stop=streak_stop,
                 stop_event=stop_event,
@@ -404,7 +417,10 @@ class JobController:
             "crawl_time": (self.config.get("schedule", {}) or {}).get("crawl_time", ""),
             "upload_time": (self.config.get("schedule", {}) or {}).get("upload_time", ""),
             "next_daily_crawl_at": self._next_run_at("daily_crawl"),
-            "next_daily_upload_at": self._next_run_at("daily_upload"),
+            "next_daily_upload_at": self.next_effective_upload_at(),
+            "upload_strategy": self._upload_strategy(),
+            "upload_interval_days": self._upload_interval_days(),
+            "next_throttle_retry_at": self.next_throttle_retry_at(),
             "playwright_headless": bool(crawl_cfg.get("playwright_headless", True)),
             "crawl_running": self._crawl_running,
             "upload_running": self._upload_running,
@@ -426,6 +442,7 @@ class JobController:
         crawl_time: str | None = None,
         upload_time: str | None = None,
         pdf_scale_bit: float | None = None,
+        upload_interval_days: int | None = None,
     ) -> dict:
         if mode is not None:
             if mode not in ("run", "test"):
@@ -472,6 +489,16 @@ class JobController:
             if not (0.1 <= scale <= 2.0):
                 raise ValueError("缩放需在 0.1 ~ 2.0 之间")
             self._update_crawl_config({"pdf_scale_bit": round(scale, 2)})
+        if upload_interval_days is not None:
+            try:
+                days = int(upload_interval_days)
+            except (TypeError, ValueError):
+                raise ValueError("上传间隔天数必须是整数")
+            if days < 0 or days > 365:
+                raise ValueError("上传间隔天数需在 0 ~ 365 之间（0=随爬取立即上传）")
+            self._update_upload_config(
+                {"strategy": "interval", "interval_days": days}
+            )
         return self.get_settings()
 
     def _update_crawl_config(self, updates: dict) -> None:
@@ -508,6 +535,7 @@ class JobController:
             "crawl.parallel_sources": crawl_cfg.get("parallel_sources", True),
             "crawl.crawl_mode": crawl_cfg.get("crawl_mode", "id_walk"),
             "crawl.id_walk_max": crawl_cfg.get("id_walk_max", 71069),
+            "crawl.id_walk_turn_back_at": crawl_cfg.get("id_walk_turn_back_at", 0),
             "crawl.id_walk_daily_span": crawl_cfg.get("id_walk_daily_span", 400),
             "crawl.id_walk_invalid_streak_stop": crawl_cfg.get(
                 "id_walk_invalid_streak_stop", 0
@@ -527,6 +555,9 @@ class JobController:
             "crawl.throttle_max_rounds": resolve_throttle_rounds(
                 crawl_cfg, default=len(resolve_throttle_ranges(crawl_cfg))
             ),
+            "crawl.throttle_retry_minutes": crawl_cfg.get(
+                "throttle_retry_minutes", 30
+            ),
             "crawl.resume_max_age_hours": crawl_cfg.get("resume_max_age_hours", 12),
             "crawl.page_load_timeout_ms": crawl_cfg.get("page_load_timeout_ms", 120_000),
             "crawl.human_verification_wait_seconds": crawl_cfg.get(
@@ -540,6 +571,8 @@ class JobController:
             ),
             "schedule.timezone": sched.get("timezone") or "（服务器本地时区）",
             "upload.mode": up.get("mode", "auto"),
+            "upload.strategy": up.get("strategy", "interval"),
+            "upload.interval_days": up.get("interval_days", 3),
             "upload.min_age_days": up.get("min_age_days", 3),
             "ragflow.base_url": rag.get("base_url", ""),
             "ragflow.chunk_method": rag.get("chunk_method", "laws"),
@@ -624,6 +657,69 @@ class JobController:
 
     def _upload_schedule_configured(self) -> bool:
         return bool((self.config.get("schedule", {}) or {}).get("upload_time"))
+
+    # ---- 运行模式上传策略：interval（每 N 天全量传未上传） / age（旧：按保存天数） ----
+    def _upload_strategy(self) -> str:
+        cfg = self.config.get("upload", {}) or {}
+        value = str(cfg.get("strategy") or "interval").strip().lower()
+        return value if value in ("interval", "age") else "interval"
+
+    def _upload_interval_days(self) -> int:
+        cfg = self.config.get("upload", {}) or {}
+        raw = cfg.get("interval_days", 3)
+        try:
+            # 0 = 随爬取立即上传（和首次运行一样），不再按天数攒
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 3
+
+    def _last_upload_datetime(self) -> datetime | None:
+        """两个来源里最近一次上传的时间（interval 策略的计时起点）。"""
+        values: list[datetime] = []
+        for raw in (self.state.snapshot().get("last_upload_time") or {}).values():
+            try:
+                values.append(datetime.fromisoformat(str(raw)))
+            except (TypeError, ValueError):
+                continue
+        return max(values) if values else None
+
+    def _upload_due(self) -> tuple[bool, datetime | None]:
+        """interval 策略：距上次上传是否已满 interval_days 天。"""
+        days = self._upload_interval_days()
+        if days <= 0:
+            return True, None
+        anchor = self._last_upload_datetime()
+        if anchor is None:
+            return True, None
+        due_at = anchor + timedelta(days=days)
+        # 留 60 秒容差：定时点在整分触发，避免差几毫秒被判成"还没到期"
+        return datetime.now() >= due_at - timedelta(seconds=60), due_at
+
+    def _next_upload_checkpoint(self, base: datetime) -> datetime | None:
+        """不早于 base 的下一个「上传时间点」（每天 HH:MM 的那个检查点）。"""
+        value = ((self.config.get("schedule", {}) or {}).get("upload_time") or "").strip()
+        if not value:
+            return None
+        try:
+            hour, minute = _parse_hhmm(value)
+        except Exception:
+            return None
+        candidate = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate < base:
+            candidate += timedelta(days=1)
+        return candidate
+
+    def next_effective_upload_at(self) -> str | None:
+        """界面上的「下一次上传」：interval 策略要算到真正会执行的那一天。"""
+        if self._upload_strategy() != "interval":
+            return self._next_run_at("daily_upload")
+        if self._upload_interval_days() <= 0:
+            return None  # 随爬取立即上传，没有固定时间点
+        _, due_at = self._upload_due()
+        now = datetime.now()
+        base = max(now, due_at) if due_at else now
+        nxt = self._next_upload_checkpoint(base)
+        return nxt.isoformat() if nxt else None
 
     def _upload_time_passed_today(self) -> bool:
         """当天设定的上传时间点是否已经过去（按 schedule.timezone 判断）。"""
@@ -729,12 +825,54 @@ class JobController:
     def scheduled_upload(self) -> None:
         """定时任务触发的上传：测试模式立即推送全部待上传，运行模式按保留天数。
 
-        同样地，已有任务在跑时本次时间点直接跳过，不排队也不补跑。
+        到点时如果爬取还没结束，上传会与爬取并行启动（不再整体跳过）。
         """
-        if self._crawl_running or self._upload_running:
-            logger.warning("定时上传跳过：已有任务运行中（这个时间点不再补跑）")
+        if self._upload_running:
+            logger.warning("定时上传跳过：已有上传任务在运行")
+            return
+        if self._crawl_running:
+            logger.info("定时上传：爬取仍在进行，上传将与爬取并行执行")
+        # 测试模式的「间隔（分钟）」上传不走这里（由 _interval_loop 直接触发），
+        # 所以到这里的是：运行模式，或测试模式的「按每日时间点」。
+        if self._upload_strategy() == "interval":
+            days = self._upload_interval_days()
+            if days <= 0:
+                logger.info(
+                    "定时上传：上传间隔为 0（随爬取立即上传），本次检查点清一遍待上传文件"
+                )
+                self._run_upload_job(immediate=True)
+                return
+            due, due_at = self._upload_due()
+            if not due:
+                anchor = self._last_upload_datetime()
+                logger.info(
+                    "定时上传跳过：每 %s 天统一上传，上次上传 %s，下次不早于 %s",
+                    days,
+                    anchor.strftime("%Y-%m-%d %H:%M:%S") if anchor else "—",
+                    due_at.strftime("%Y-%m-%d %H:%M:%S"),
+                )
+                return
+            logger.info(
+                "定时上传：距上次上传已满 %s 天，上传全部未上传文件（不看文件年龄）",
+                days,
+            )
+            self._run_upload_job(immediate=True)
             return
         if self.mode == "test":
+            self._run_upload_job(immediate=True)
+        else:
+            self._run_upload_job(immediate=False)
+
+    def _run_upload_job(self, *, immediate: bool) -> None:
+        """按当前是否在爬取决定同步/异步执行上传。"""
+        if self._crawl_running:
+            try:
+                self.start_upload(allow_during_crawl=True, immediate=immediate)
+                logger.info("上传任务已启动，与爬取并行执行")
+            except RuntimeError as exc:
+                logger.warning("定时上传未启动：%s", exc)
+            return
+        if immediate:
             self.upload_now_sync()
         else:
             self.upload_sync()
@@ -752,6 +890,7 @@ class JobController:
         # 首次全量爬取是在定时器启动之前跑的，那时没法安排重试；
         # 这里补上，保证那批被跳过的分类也能按间隔自动重试
         self.schedule_skipped_retry()
+        self.schedule_throttle_retry()
 
     def apply_schedule(self) -> None:
         """按当前配置重建每日定时任务；时间为空表示停用该任务。"""
@@ -849,6 +988,8 @@ class JobController:
         """一轮爬取结束后的收尾：安排跳过分类重试、判断首次运行是否完成。"""
         self._retry_round = 0
         self.schedule_skipped_retry()
+        # id_walk 方式没有"被跳过的子分类"，限流结束时靠这里安排 30 分钟后的自动重试
+        self.schedule_throttle_retry()
         if not self.state.is_first_run():
             return
         need = {"ccdi", "bit"} if source == "all" else {source}
@@ -881,6 +1022,92 @@ class JobController:
         except (TypeError, ValueError):
             last_id = 0
         return last_id < ceiling
+
+    # ------------------------------------------------------------------
+    # 持续限流：退避 3 轮仍失败后，隔一段时间自动重新开一轮
+    # ------------------------------------------------------------------
+    def _throttle_retry_minutes(self) -> int:
+        cfg = self.config.get("crawl", {}) or {}
+        try:
+            return max(0, int(cfg.get("throttle_retry_minutes", 30) or 0))
+        except (TypeError, ValueError):
+            return 30
+
+    def _throttle_alert_active(self) -> bool:
+        return any(
+            a.get("key") == THROTTLE_ALERT_KEY
+            for a in self.state.list_alerts()
+        )
+
+    def next_throttle_retry_at(self) -> str | None:
+        if self._scheduler is None:
+            return None
+        job = self._scheduler.get_job(THROTTLE_RETRY_JOB_ID)
+        if job is None or job.next_run_time is None:
+            return None
+        return job.next_run_time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    def cancel_throttle_retry(self, *, reason: str = "") -> None:
+        if self._scheduler is None:
+            return
+        if self._scheduler.get_job(THROTTLE_RETRY_JOB_ID):
+            self._scheduler.remove_job(THROTTLE_RETRY_JOB_ID)
+            logger.info(
+                "已取消待执行的限流自动重试%s", f"（{reason}）" if reason else ""
+            )
+
+    def schedule_throttle_retry(self, *, minutes: int | None = None) -> None:
+        """中纪检持续限流结束时，安排若干分钟后再跑一轮（续爬同一位置）。"""
+        if not self._throttle_alert_active():
+            self.cancel_throttle_retry()
+            return
+        if self._stop_event.is_set():
+            # 用户主动点「终止」的，不自动重试
+            return
+        if self._scheduler is None:
+            return
+        delay = self._throttle_retry_minutes() if minutes is None else max(0, minutes)
+        if delay <= 0:
+            logger.info(
+                "中纪检持续限流；自动重试已关闭（crawl.throttle_retry_minutes=0）"
+            )
+            return
+        run_at = datetime.now() + timedelta(minutes=delay)
+        self._scheduler.add_job(
+            self.retry_throttled_ccdi,
+            DateTrigger(run_date=run_at),
+            id=THROTTLE_RETRY_JOB_ID,
+            replace_existing=True,
+        )
+        # 把具体重试时间写进顶部横幅，界面上能直接看到
+        self.state.set_alert(
+            THROTTLE_ALERT_KEY,
+            f"{THROTTLE_ALERT_TEXT.rstrip('。')}。"
+            f"将在 {run_at.strftime('%Y-%m-%d %H:%M:%S')} 自动重试。",
+            level="error",
+        )
+        logger.info(
+            "已安排中纪检限流自动重试：%s（%s 分钟后）",
+            run_at.strftime("%Y-%m-%d %H:%M:%S"),
+            delay,
+        )
+
+    def retry_throttled_ccdi(self) -> None:
+        """定时触发：限流结束后的自动重试（从中纪检断点续爬）。"""
+        if self._crawl_running or self._upload_running:
+            logger.warning("限流自动重试推迟：当前有任务运行中，10 分钟后再试")
+            self.schedule_throttle_retry(minutes=10)
+            return
+        logger.info("限流自动重试：重新开始中纪检爬取")
+        self._stop_event.clear()
+        self._pause_event.clear()
+        self._crawl_running = True
+        try:
+            self._run_crawl_with_upload("ccdi", async_upload=True)
+        except Exception:
+            logger.exception("限流自动重试失败")
+        finally:
+            self._crawl_running = False
 
     def upload_sync(self) -> None:
         """同步执行定时上传（按保留天数）。"""
@@ -960,7 +1187,20 @@ class JobController:
             return
         if self.upload_mode != "auto":
             return
-        if not first_time and self._upload_schedule_configured():
+        strategy = self._upload_strategy()
+        interval_days = self._upload_interval_days()
+        if not first_time and strategy == "interval":
+            if interval_days > 0:
+                logger.info(
+                    "自动上传：每 %s 天统一上传，本次爬取结束后不立即上传"
+                    "（到点由定时任务一次性上传全部未上传文件）",
+                    interval_days,
+                )
+                return
+            logger.info(
+                "自动上传：上传间隔设为 0，随爬取立即上传全部未上传文件"
+            )
+        if not first_time and strategy == "age" and self._upload_schedule_configured():
             upload_at = self.config.get("schedule", {}).get("upload_time")
             if not self._upload_time_passed_today():
                 logger.info(
@@ -1010,17 +1250,27 @@ class JobController:
             "max_items": max_items,
         }
 
-    def start_upload(self) -> dict:
-        """UI 触发：异步立即上传全部待上传文件。"""
-        if self._upload_running or self._crawl_running:
+    def start_upload(
+        self, *, allow_during_crawl: bool = False, immediate: bool = True
+    ) -> dict:
+        """异步上传；默认只允许空闲时（UI 的「立即上传」）。
+
+        allow_during_crawl=True 时允许与爬取并行——定时上传到点就要传，
+        不能因为爬取还没结束就整体跳过。
+        """
+        if self._upload_running or (self._crawl_running and not allow_during_crawl):
             raise RuntimeError("已有任务运行中")
-        self._stop_event.clear()
-        self._pause_event.clear()
+        if not self._crawl_running:
+            # 爬取在跑时不要动这两个事件，否则会把用户暂停的任务"顺带"继续
+            self._stop_event.clear()
+            self._pause_event.clear()
+        elif self._stop_event.is_set():
+            raise RuntimeError("当前任务已终止")
         self._upload_running = True
 
         def worker() -> None:
             try:
-                self._upload_blocking(True, self._stop_event, self._pause_event)
+                self._upload_blocking(immediate, self._stop_event, self._pause_event)
             except Exception:
                 logger.exception("UI 触发的上传失败")
             finally:
@@ -1032,6 +1282,7 @@ class JobController:
     def stop_all(self) -> dict:
         """终止所有任务（爬取 / 上传，含自动上传），并取消待执行的中纪检跳过分类重试。"""
         self.cancel_skipped_retry(reason="已终止所有任务")
+        self.cancel_throttle_retry(reason="已终止所有任务")
         if not (self._crawl_running or self._upload_running):
             self._pause_event.clear()
             # 状态文件仍显示运行中，说明任务在别的进程里（例如终端单次任务），
@@ -1375,6 +1626,17 @@ def main() -> None:
             monitor_cfg.get("port", 8765),
         )
 
+    # 定时任务先注册：首次全量 / --crawl-now 可能要跑很久，
+    # 这样到点的上传仍能按计划触发（上传与爬取并行）。
+    scheduler = None
+    # 只要开着监控界面就启动定时任务：界面里可以配置每日时间点，
+    # 若这里悄悄跳过，就会出现“设了时间却不执行”的困惑。
+    # 只有 --no-schedule 且 --no-ui（纯单次执行）时才不注册定时任务。
+    if not args.no_schedule or not args.no_ui:
+        scheduler = start_scheduler(state, config, controller)
+    else:
+        logger.info("已跳过定时任务（--no-schedule --no-ui：单次执行模式）")
+
     ran_work = False
     if first_run and not args.no_auto_start:
         logger.info("首次运行：全量爬取（边爬边批量上传），结束后收尾上传")
@@ -1394,15 +1656,6 @@ def main() -> None:
         if args.upload_now:
             controller.upload_now_sync()
             ran_work = True
-
-    scheduler = None
-    # 只要开着监控界面就启动定时任务：界面里可以配置每日时间点，
-    # 若这里悄悄跳过，就会出现“设了时间却不执行”的困惑。
-    # 只有 --no-schedule 且 --no-ui（纯单次执行）时才不注册定时任务。
-    if not args.no_schedule or not args.no_ui:
-        scheduler = start_scheduler(state, config, controller)
-    else:
-        logger.info("已跳过定时任务（--no-schedule --no-ui：单次执行模式）")
 
     if args.no_schedule and args.no_ui:
         if ran_work:

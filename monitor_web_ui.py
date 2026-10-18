@@ -261,6 +261,10 @@ HTML_TEMPLATE = """
         <label>每日上传时间（留空=不启用）
           <input id="run_upload_time" type="time" onchange="saveScheduleTimes('run')" />
         </label>
+        <label>上传间隔（天，0=随爬取立即上传）
+          <input id="run_upload_days" type="number" min="0" max="365" step="1" value="3"
+                 onchange="saveUploadDays(this)" />
+        </label>
       </div>
       <div class="stat-row" id="run_schedule_info"></div>
       <div class="config-view" id="run_config_view"></div>
@@ -315,6 +319,10 @@ HTML_TEMPLATE = """
               <input id="test_crawl_time" type="time" title="留空=不启用" onchange="saveScheduleTimes('test')" />
               <span class="muted">上传</span>
               <input id="test_upload_time" type="time" title="留空=不启用" onchange="saveScheduleTimes('test')" />
+              <span class="muted">每</span>
+              <input id="test_upload_days" type="number" min="0" max="365" step="1" value="3"
+                     title="0=随爬取立即上传" onchange="saveUploadDays(this)" />
+              <span class="muted">天上传</span>
             </div>
           </div>
         </div>
@@ -324,7 +332,7 @@ HTML_TEMPLATE = """
       <div class="hint">间隔到点后按上面的「来源 + 测试爬取条数」执行：来源为「全部」时，中纪检、校纪检各爬该条数。间隔上传会把当前所有未上传的文件推送到知识库；爬取与上传不会同时进行，若到点时任务正忙则顺延到下一个间隔。</div>
     </div>
 
-    <div class="hint">选择模式后，用上方「总控制」的开始/暂停/终止来运行。上传选「自动」时，爬取结束后立即顺序执行上传；选「手动」时，爬取完成后点「立即上传」。</div>
+    <div class="hint">选择模式后，用上方「总控制」的开始/暂停/终止来运行。上传选「自动」时看「上传间隔（天）」：填 0 → 每次爬取结束后立即上传全部未上传文件（和首次运行一样）；填 N → 每 N 天到上传时间点统一上传一次。选「手动」时，爬取完成后点「立即上传」。</div>
     <div class="muted" id="ctl_status">—</div>
   </div>
 
@@ -482,9 +490,13 @@ function applySettings(s) {
     setInputValue('run_upload_time', s.upload_time || '');
     setInputValue('test_crawl_time', s.crawl_time || '');
     setInputValue('test_upload_time', s.upload_time || '');
+    if (s.upload_interval_days !== undefined && s.upload_interval_days !== null) {
+      setInputValue('run_upload_days', s.upload_interval_days);
+      setInputValue('test_upload_days', s.upload_interval_days);
+    }
     document.getElementById('run_schedule_info').innerHTML =
       timeTag('下一次爬取', fmtTime(s.next_daily_crawl_at), 'next')
-      + timeTag('下一次上传', fmtTime(s.next_daily_upload_at), 'next');
+      + timeTag('下一次上传', nextUploadLabel(s), 'next');
   }
   if (s.test_source) {
     document.getElementById('test_source').value = s.test_source;
@@ -495,7 +507,8 @@ function applySettings(s) {
   if (schedEl) {
     schedEl.innerHTML =
       timeTag('下一次爬取', fmtTime(uiTestSched === 'daily' ? s.next_daily_crawl_at : s.next_crawl_at), 'next')
-      + timeTag('下一次上传', fmtTime(uiTestSched === 'daily' ? s.next_daily_upload_at : s.next_upload_at), 'next');
+      + timeTag('下一次上传',
+          uiTestSched === 'daily' ? nextUploadLabel(s) : fmtTime(s.next_upload_at), 'next');
   }
   if (s.output_dir) {
     setInputValue('top_output_dir', s.output_dir);
@@ -591,6 +604,30 @@ async function saveScheduleTimes(scope) {
   if (r.data.settings) applySettings(r.data.settings);
 }
 
+async function saveUploadDays(el) {
+  const raw = el && el.value !== undefined
+    ? el.value
+    : document.getElementById('run_upload_days').value;
+  const days = parseInt(raw, 10);
+  if (isNaN(days) || days < 0) {
+    setCtlStatus('上传间隔必须是不小于 0 的整数', true);
+    return;
+  }
+  const r = await api('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ upload_interval_days: days }),
+  });
+  if (!r.ok) { setCtlStatus('保存上传间隔失败：' + (r.data.error || r.status), true); return; }
+  setCtlStatus(
+    days === 0
+      ? '上传间隔已设为 0：每次爬取结束后立即上传全部未上传文件'
+      : '上传间隔已设为每 ' + days + ' 天统一上传',
+    false
+  );
+  if (r.data.settings) applySettings(r.data.settings);
+}
+
 async function savePdfScale() {
   const value = parseFloat(document.getElementById('test_pdf_scale_bit').value);
   if (isNaN(value)) { setCtlStatus('缩放必须是数字', true); return; }
@@ -620,6 +657,14 @@ function fmtTime(iso) {
   const p = n => String(n).padStart(2, '0');
   return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' '
     + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+// 「下一次上传」：间隔设为 0 时是随爬取立即上传，没有固定时间点
+function nextUploadLabel(s) {
+  if (s && s.upload_strategy === 'interval' && s.upload_interval_days === 0) {
+    return '随爬取立即上传';
+  }
+  return fmtTime(s ? s.next_daily_upload_at : null);
 }
 
 // 时间标签：next 用于“下一次”，默认用于“上一次”
@@ -1165,8 +1210,12 @@ async function refresh() {
   const curCat = s.current_category
     ? '<div class="pc-msg" style="margin-top:6px">当前分类：' + esc(s.current_category) + '</div>'
     : '';
+  const throttleNext = (data.settings && data.settings.next_throttle_retry_at)
+    ? '<div class="pc-msg" style="margin-top:6px">限流自动重试：'
+      + esc(fmtTime(data.settings.next_throttle_retry_at)) + '</div>'
+    : '';
   document.getElementById('summary').innerHTML =
-    progressCard('中纪检', s.progress.ccdi, s.last_crawl_time.ccdi, s.last_upload_time.ccdi, curCat)
+    progressCard('中纪检', s.progress.ccdi, s.last_crawl_time.ccdi, s.last_upload_time.ccdi, curCat + throttleNext)
     + progressCard('校纪检', s.progress.bit, s.last_crawl_time.bit, s.last_upload_time.bit)
     + `<div class="card progress-card">
       <div class="pc-title">今日 / 总量</div>
@@ -1337,6 +1386,7 @@ def create_monitor_app(controller) -> Flask:
                 crawl_time=payload.get("crawl_time"),
                 upload_time=payload.get("upload_time"),
                 pdf_scale_bit=payload.get("pdf_scale_bit"),
+                upload_interval_days=payload.get("upload_interval_days"),
             )
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
