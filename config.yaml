@@ -1,6 +1,27 @@
 # 输出根目录（可在命令行用 --output-dir 覆盖）
 output_dir: "./data/regulations"
 
+# 日志
+logging:
+  # 全局日志级别：DEBUG / INFO / WARNING / ERROR
+  # 只想看告警和错误就填 WARNING（爬取进度日志会不再写盘）
+  level: "INFO"
+  # 是否记录每个 HTTP 请求（UI 每秒轮询几次，开着会把日志刷满；默认关）
+  http_access: false
+  # 日志文件：留空 = 只输出到控制台（配合 nohup >> logs/app.log 或系统 logrotate）；
+  # 填 logs/app.log = 程序自己写文件并按大小轮转；此时启动命令的重定向要改成 >/dev/null，
+  # 否则 nohup 与程序会同时写同一个文件
+  file: ""
+  # 单文件上限（字节，默认 10MB）与保留份数
+  max_bytes: 10485760
+  backup_count: 5
+  # 每次爬取单独一个日志文件：logs/runs/<开始>至<结束>.log
+  run_log:
+    enabled: true
+    dir: "logs/runs"
+    # 没有 ERROR 的日志保留几天；有 ERROR 的一律保留
+    keep_days: 7
+
 # 爬虫
 crawl:
   # 中纪检抓取方式：
@@ -32,7 +53,7 @@ crawl:
   throttle_wait_ranges:
     - [10, 11]
     - [2, 3]
-    - [5, 7]
+    - [7, 9]
   # 连续退避次数上限（默认等于上面区间的条数）：
   # 连续 3 次仍被限流则报错并暂停本轮爬取，未完成的分类交给定时重试。
   # 中途一旦成功（取到列表/导出成功）计数归零，所以「每 20~30 条限流一次」时每次都有 3 次机会。

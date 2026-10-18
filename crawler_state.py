@@ -4,12 +4,25 @@ from __future__ import annotations
 
 import json
 import threading
+from functools import wraps
 from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-_lock = threading.Lock()
+# 可重入锁：所有读写 self._data 的方法都在锁内执行，
+# 避免 UI 线程 deepcopy 时爬虫/上传线程正在往字典里加记录
+# （RuntimeError: dictionary changed size during iteration）。
+_lock = threading.RLock()
+
+
+def _locked(method):
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with _lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _now_iso() -> str:
@@ -45,6 +58,7 @@ class CrawlerState:
             "documents": {},
         }
 
+    @_locked
     def load(self) -> None:
         if not self.state_path.exists():
             self.save()
@@ -67,6 +81,7 @@ class CrawlerState:
         except OSError:
             return None
 
+    @_locked
     def reload(self) -> None:
         """若状态文件被其它进程（例如终端里的单次任务）改过，则重新载入。
 
@@ -77,6 +92,7 @@ class CrawlerState:
             return
         self.load()
 
+    @_locked
     def save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         with _lock:
@@ -88,10 +104,12 @@ class CrawlerState:
             tmp.replace(self.state_path)
         self._loaded_mtime = self._mtime()
 
+    @_locked
     def snapshot(self) -> dict[str, Any]:
         with _lock:
             return deepcopy(self._data)
 
+    @_locked
     def set_progress(
         self,
         source: str,
@@ -124,14 +142,17 @@ class CrawlerState:
             self._set_cursor(source, **cursor)
         self.save()
 
+    @_locked
     def set_last_crawl(self, source: str) -> None:
         self._data.setdefault("last_crawl_time", {})[source] = _now_iso()
         self.save()
 
+    @_locked
     def set_last_upload(self, source: str) -> None:
         self._data.setdefault("last_upload_time", {})[source] = _now_iso()
         self.save()
 
+    @_locked
     def bump_daily_new(self, count: int = 1, *, persist: bool = True) -> None:
         key = date.today().isoformat()
         daily = self._data.setdefault("daily_new_count", {})
@@ -139,22 +160,26 @@ class CrawlerState:
         if persist:
             self.save()
 
+    @_locked
     def set_alert(self, key: str, message: str, level: str = "warning") -> None:
         """登记一条界面提示（会持久化，供 UI 顶部横幅展示）。"""
         alerts = self._data.setdefault("alerts", {})
         alerts[key] = {"level": level, "message": message, "time": _now_iso()}
         self.save()
 
+    @_locked
     def clear_alert(self, key: str) -> None:
         alerts = self._data.setdefault("alerts", {})
         if key in alerts:
             del alerts[key]
             self.save()
 
+    @_locked
     def list_alerts(self) -> list[dict[str, Any]]:
         alerts = self._data.get("alerts", {})
         return [{"key": k, **v} for k, v in alerts.items()]
 
+    @_locked
     def set_skipped_categories(
         self, source: str, items: list[dict[str, Any]], *, retryable: bool = True
     ) -> None:
@@ -174,6 +199,7 @@ class CrawlerState:
             data.pop(source, None)
         self.save()
 
+    @_locked
     def get_skipped_categories(
         self, source: str, *, retryable_only: bool = False
     ) -> list[dict[str, Any]]:
@@ -186,6 +212,7 @@ class CrawlerState:
         items = entry.get("items") or []
         return [dict(i) for i in items if isinstance(i, dict)]
 
+    @_locked
     def set_crawl_cursor(
         self,
         source: str,
@@ -204,6 +231,7 @@ class CrawlerState:
         )
         self.save()
 
+    @_locked
     def _set_cursor(
         self,
         source: str,
@@ -223,10 +251,12 @@ class CrawlerState:
             "updated_at": _now_iso(),
         }
 
+    @_locked
     def get_crawl_cursor(self, source: str) -> dict[str, Any] | None:
         cur = self._data.get("crawl_cursor", {}).get(source)
         return dict(cur) if isinstance(cur, dict) else None
 
+    @_locked
     def set_category_status(
         self, source: str, code: str, **fields: Any
     ) -> None:
@@ -237,12 +267,14 @@ class CrawlerState:
         entry["updated_at"] = _now_iso()
         self.save()
 
+    @_locked
     def get_category_status(self, source: str) -> dict[str, dict[str, Any]]:
         cats = self._data.get("category_status", {}).get(source)
         if not isinstance(cats, dict):
             return {}
         return {k: dict(v) for k, v in cats.items() if isinstance(v, dict)}
 
+    @_locked
     def update_category_statuses(
         self, source: str, updates: dict[str, dict[str, Any]]
     ) -> None:
@@ -255,6 +287,7 @@ class CrawlerState:
             entry["updated_at"] = now
         self.save()
 
+    @_locked
     def set_throttle_state(
         self, source: str, *, round_no: int = 0, resume_at: str = ""
     ) -> None:
@@ -271,15 +304,18 @@ class CrawlerState:
         }
         self.save()
 
+    @_locked
     def get_throttle_state(self, source: str) -> dict[str, Any] | None:
         rec = self._data.get("throttle_state", {}).get(source)
         return dict(rec) if isinstance(rec, dict) else None
 
+    @_locked
     def clear_throttle_state(self, source: str) -> None:
         data = self._data.setdefault("throttle_state", {})
         if data.pop(source, None) is not None:
             self.save()
 
+    @_locked
     def set_id_walk_position(
         self, source: str, last_id: int, **extra: Any
     ) -> None:
@@ -299,16 +335,19 @@ class CrawlerState:
         data[source] = rec
         self.save()
 
+    @_locked
     def get_id_walk_position(self, source: str) -> dict[str, Any] | None:
         rec = self._data.get("id_walk", {}).get(source)
         return dict(rec) if isinstance(rec, dict) else None
 
+    @_locked
     def set_total_estimate(self, source: str, value: int) -> None:
         """缓存「库总量估算」（如中纪检 6444），重启时不必每次都去站点上重算。"""
         data = self._data.setdefault("total_estimate", {})
         data[source] = {"value": int(value), "updated_at": _now_iso()}
         self.save()
 
+    @_locked
     def get_total_estimate(
         self, source: str, max_age_hours: float | None = 24.0
     ) -> int | None:
@@ -329,27 +368,33 @@ class CrawlerState:
                 return None
         return value
 
+    @_locked
     def set_first_run(self, value: bool) -> None:
         """标记/取消“首次运行”（首次采集完成、且下一次定时任务执行后取消）。"""
         self._data["first_run_pending"] = bool(value)
         self.save()
 
+    @_locked
     def is_first_run(self) -> bool:
         return bool(self._data.get("first_run_pending"))
 
+    @_locked
     def mark_pass_done(self, source: str) -> None:
         """标记某个来源已完成一次「完整遍历」（首次运行据此判断是否可以收尾）。"""
         data = self._data.setdefault("pass_done", {})
         data[source] = True
         self.save()
 
+    @_locked
     def is_pass_done(self, source: str) -> bool:
         return bool((self._data.get("pass_done") or {}).get(source))
 
+    @_locked
     def reset_pass_done(self) -> None:
         self._data["pass_done"] = {}
         self.save()
 
+    @_locked
     def register_document(
         self,
         doc_key: str,
@@ -378,6 +423,7 @@ class CrawlerState:
         self.save()
         return True
 
+    @_locked
     def repoint_document(self, doc_key: str, pdf_path: str) -> None:
         """已登记文档的 PDF 被重新导出时，把路径改到新文件（避免留下孤儿文件）。"""
         rec = (self._data.get("documents") or {}).get(doc_key)
@@ -387,6 +433,7 @@ class CrawlerState:
             rec["pdf_path"] = pdf_path
             self.save()
 
+    @_locked
     def mark_uploaded(self, doc_key: str, dataset_id: str) -> None:
         docs = self._data.setdefault("documents", {})
         if doc_key not in docs:
@@ -395,6 +442,7 @@ class CrawlerState:
         docs[doc_key]["upload_dataset_id"] = dataset_id
         self.save()
 
+    @_locked
     def mark_pdf_path(self, doc_key: str, pdf_path: str) -> None:
         """修正已登记文档的 PDF 路径（文件被移动/重写后，避免每轮重复导出）。"""
         docs = self._data.setdefault("documents", {})
@@ -403,6 +451,7 @@ class CrawlerState:
         docs[doc_key]["pdf_path"] = pdf_path
         self.save()
 
+    @_locked
     def list_documents(self, source: str | None = None) -> list[dict[str, Any]]:
         docs = self._data.get("documents", {})
         rows = []
@@ -413,6 +462,7 @@ class CrawlerState:
         rows.sort(key=lambda x: x.get("crawled_at") or "", reverse=True)
         return rows
 
+    @_locked
     def pending_upload_keys(
         self,
         source: str,

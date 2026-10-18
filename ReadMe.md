@@ -101,6 +101,15 @@
 | `ragflow.chunk_method` / `chunk_token_num` | `laws` / `512` | 分块方式与大小 |
 | `ragflow.dataset_id_ccdi` / `dataset_id_bit` | 空 | 库已存在时可填 ID 跳过自动创建 |
 | `monitor.host` / `monitor.port` | `0.0.0.0` / `8765` | 监控界面监听地址与端口 |
+| `logging.level` | `INFO` | 日志级别；只关心告警和错误就填 `WARNING` |
+| `logging.http_access` | `false` | 是否记录每个 HTTP 请求；UI 每秒轮询，默认关闭避免刷屏 |
+| `logging.file` | `""` | 留空=只输出控制台（配合 `nohup >> logs/app.log` 或系统 logrotate）；填 `logs/app.log` 则由程序写文件并自动轮转（此时启动命令重定向应改成 `>/dev/null`） |
+| `logging.max_bytes` / `backup_count` | `10485760` / `5` | 内置轮转的单文件上限（10MB）与保留份数 |
+| `logging.run_log.enabled` | `true` | 每次爬取单独写一个日志文件 `logs/runs/<开始>至<结束>.log` |
+| `logging.run_log.dir` | `logs/runs` | 每日运行日志目录 |
+| `logging.run_log.keep_days` | `7` | 没有 ERROR 的日志保留天数；有 ERROR 的一律保留 |
+
+**每日运行日志**：每次爬取（每日定时 / 首次全量 / UI 点开始 / `--crawl-now` / 自动重试）都会单独写 `logs/runs/2026-10-18-09-00-00至2026-10-18-21-30-12.log`。下一次爬取开始前会检查**昨天**这一天的日志：有 `[ERROR]`（或未捕获异常的 `Traceback`）就在界面顶部弹红色横幅并列出文件名，这些文件永久保留；没有错误则按 `keep_days` 过期删除。开启它之后，nohup 重定向的 `logs/app.log` 只保留 WARNING/ERROR，不会再被 INFO 刷满。
 
 > 在监控界面里修改的设置（每日时间点、校纪检缩放、RAGFlow 地址与库名等）会写回 `config.yaml`。
 

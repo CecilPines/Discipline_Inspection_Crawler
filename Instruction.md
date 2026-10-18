@@ -385,6 +385,68 @@ echo $! > logs/app.pid
 # 看日志：tail -f logs/app.log      停止：kill $(cat logs/app.pid)
 ```
 
+**每日运行日志（默认开启）**
+
+每次爬取（每日定时、首次全量、UI 点「开始」、`--crawl-now`、自动重试都算）会单独一个文件：
+
+```
+logs/runs/2026-10-18-09-00-00至2026-10-18-21-30-12.log
+```
+
+- 开始爬取时先建 `<开始>.log`，结束时关闭并把名字补成 `<开始>至<结束>.log`；
+- **下一次爬取开始前**检查「昨天」这一天的日志：
+  - 有 `[ERROR]`（或未捕获异常的 `Traceback`）→ 界面顶部红色横幅「昨日（2026-10-17）爬取日志有 N 处 ERROR：xxx.log（已保留，目录 …）」，这些文件**永久保留**，不会被清理；
+  - 没有 → 超过 `logging.run_log.keep_days`（默认 7 天）后自动删除；
+- 开了这个之后，`nohup` 重定向的 `logs/app.log` 只保留 WARNING/ERROR（程序里给控制台 handler 设了 WARNING 级别），所以它不会再被 INFO 刷满；
+- 配置（`config.yaml`）：
+  ```yaml
+  logging:
+    run_log:
+      enabled: true
+      dir: "logs/runs"
+      keep_days: 7        # 无 ERROR 的保留几天；有 ERROR 的永久保留
+  ```
+
+`logs/app.log` 本身也可以用下面三种方式之一再收拾一下：
+
+1. **只记警告和错误**（最省事，不用改启动命令）：`config.yaml` 里设
+   ```yaml
+   logging:
+     level: "WARNING"
+   ```
+   重启进程后生效：爬取进度、`GET /api/status` 这类 INFO 日志都不再写盘，只留 WARNING/ERROR。
+2. **程序内按大小轮转**（推荐，改完启动命令）：
+   ```yaml
+   logging:
+     level: "INFO"
+     http_access: false        # 默认就是 false，别开，开了每秒两条请求日志
+     file: "logs/app.log"      # 程序自己写这个文件
+     max_bytes: 10485760       # 10MB
+     backup_count: 5           # 最多保留 5 份（app.log.1 … app.log.5）
+   ```
+   此时启动命令要把重定向改掉，避免 nohup 和程序同时写同一个文件：
+   ```bash
+   nohup .venv/bin/python main.py --crawl-now >/dev/null 2>&1 &
+   ```
+   （控制台只保留 WARNING/ERROR，未捕获异常的 traceback 仍会经 stderr 输出，若想留底可改成 `>> logs/console.log 2>&1`。）
+3. **交给系统 logrotate**（保持现在的 nohup 命令不变）：
+   ```bash
+   sudo tee /etc/logrotate.d/discipline-crawler > /dev/null <<'EOF'
+   /home/bit/projects/Discipline_Inspection_Crawler/logs/app.log {
+       daily
+       rotate 7
+       maxsize 50M
+       missingok
+       notifempty
+       copytruncate
+   }
+   EOF
+   ```
+   `copytruncate` 不用重启进程。已经很大的旧日志可以先清空：
+   ```bash
+   : > logs/app.log          # 不影响正在运行的进程（nohup 是追加写）
+   ```
+
 
 **方式三：systemd —— 开机自启 + 崩溃自动重启；需要 sudo（会在项目外放一个 unit 文件，日志仍写在项目内）**
 
@@ -567,6 +629,10 @@ curl -s http://<host>:<port>/api/v1/datasets -H "Authorization: Bearer <key>" | 
 - 没设上传点 → `age` 策略下爬完立即上传；选「手动」→ 只在点「立即上传」时上传。
 
 「立即上传」和首次运行不受任何期限限制，全部推送。
+
+**`/api/status` 报 `RuntimeError: dictionary changed size during iteration`？**
+
+旧版本的状态文件读写没有加锁：UI 线程每秒 `deepcopy` 一次状态，而爬虫/上传线程同时在往 `documents` 里加记录，就会撞出这个异常（只影响那一次 `/api/status` 请求，状态文件本身没坏）。现在 `CrawlerState` 的所有读写方法都加了同一把可重入锁（`crawler_state.py` 里的 `_locked`），`snapshot()` 的 `deepcopy` 不会再有并发写入。升级后重启进程即可；不需要删 `crawler_state.json`。
 
 **重启后界面还停在上一次的状态？**
 

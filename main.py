@@ -44,18 +44,79 @@ from crawl_common import (
     resolve_throttle_ranges,
 )
 from crawler_state import CrawlerState
+from daily_run_log import DailyRunLog
 from monitor_web_ui import run_monitor_server
 from ragflow_kb_uploader import get_agent_status, run_scheduled_uploads
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("discipline_crawler")
 
+
+def _setup_logging(config: dict) -> None:
+    """按 config.yaml 的 logging 段配置日志级别与文件轮转。
+
+    level：DEBUG/INFO/WARNING/ERROR（只看告警和错误就填 WARNING）；
+    http_access：是否记录每个 HTTP 请求（UI 每秒轮询，默认关闭）；
+    file：日志文件路径（相对路径以项目目录为基准），留空则只输出到控制台；
+    max_bytes / backup_count：按大小轮转，例如 10MB × 5 份。
+    """
+    log_cfg = config.get("logging", {}) or {}
+    level_name = str(log_cfg.get("level", "INFO") or "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    stream = logging.StreamHandler()
+    handlers: list[logging.Handler] = [stream]
+    file_path = str(log_cfg.get("file") or "").strip()
+    run_log_cfg = log_cfg.get("run_log", {}) or {}
+    run_log_enabled = bool(run_log_cfg.get("enabled", True))
+    if file_path:
+        try:
+            from logging.handlers import RotatingFileHandler
+
+            path = Path(file_path)
+            if not path.is_absolute():
+                path = Path(__file__).resolve().parent / path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handlers.append(
+                RotatingFileHandler(
+                    path,
+                    maxBytes=max(
+                        1024 * 1024, int(log_cfg.get("max_bytes", 10 * 1024 * 1024))
+                    ),
+                    backupCount=max(1, int(log_cfg.get("backup_count", 5))),
+                    encoding="utf-8",
+                )
+            )
+        except (OSError, ValueError) as exc:
+            print(f"日志文件初始化失败，仅输出到控制台：{exc}")
+    if file_path or run_log_enabled:
+        # 已经写了独立日志文件，控制台只保留告警/错误，免得 nohup 的重定向文件也跟着涨
+        stream.setLevel(logging.WARNING)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+    # werkzeug 默认把每个请求按 INFO 记一行；UI 每秒轮询两次，不关会刷屏
+    http_level = (
+        logging.INFO if bool(log_cfg.get("http_access", False)) else logging.WARNING
+    )
+    for name in ("werkzeug", "flask.app"):
+        logging.getLogger(name).setLevel(http_level)
+    logger.info(
+        "日志配置：级别 %s · 文件 %s · HTTP 访问日志 %s",
+        level_name,
+        file_path or "（仅控制台）",
+        "开" if http_level == logging.INFO else "关",
+    )
+
 # 中纪检被跳过的子分类的重试任务 id（由调度器执行）
 SKIPPED_RETRY_JOB_ID = "skipped_category_retry"
 THROTTLE_RETRY_JOB_ID = "ccdi_throttle_retry"
+RUN_LOG_ALERT_KEY = "daily_log_error"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -394,6 +455,16 @@ class JobController:
         self._scheduler: BackgroundScheduler | None = None
         # 中纪检跳过分类的自动重试：已重试轮数（每次完整爬取后归零）
         self._retry_round = 0
+        # 每次爬取一个独立日志文件（logs/runs/<开始>至<结束>.log）
+        run_log_cfg = ((config.get("logging", {}) or {}).get("run_log", {}) or {})
+        run_log_dir = Path(str(run_log_cfg.get("dir") or "logs/runs"))
+        if not run_log_dir.is_absolute():
+            run_log_dir = Path(__file__).resolve().parent / run_log_dir
+        self.run_log = DailyRunLog(
+            run_log_dir,
+            keep_days=int(run_log_cfg.get("keep_days", 7) or 7),
+            enabled=bool(run_log_cfg.get("enabled", True)),
+        )
 
     def get_settings(self) -> dict:
         crawl_cfg = self.config.get("crawl", {}) or {}
@@ -526,6 +597,7 @@ class JobController:
         rag = self.config.get("ragflow", {}) or {}
         sched = self.config.get("schedule", {}) or {}
         up = self.config.get("upload", {}) or {}
+        log_cfg = self.config.get("logging", {}) or {}
         return {
             "output_dir": str(self.output_dir),
             "crawl.playwright_headless": crawl_cfg.get("playwright_headless", True),
@@ -578,6 +650,15 @@ class JobController:
             "ragflow.chunk_method": rag.get("chunk_method", "laws"),
             "ragflow.dataset_name_ccdi": rag.get("dataset_name_ccdi", "中纪检"),
             "ragflow.dataset_name_bit": rag.get("dataset_name_bit", "校纪检"),
+            "logging.run_log.enabled": (log_cfg.get("run_log", {}) or {}).get(
+                "enabled", True
+            ),
+            "logging.run_log.dir": (log_cfg.get("run_log", {}) or {}).get(
+                "dir", "logs/runs"
+            ),
+            "logging.run_log.keep_days": (log_cfg.get("run_log", {}) or {}).get(
+                "keep_days", 7
+            ),
         }
 
     @staticmethod
@@ -943,16 +1024,64 @@ class JobController:
         parallel: bool = False,
         categories: list[str] | None = None,
     ) -> None:
-        run_crawl_jobs(
-            self.state,
-            self.config,
-            source=source,
-            max_items=max_items,
-            stop_event=stop_event,
-            pause_event=pause_event,
-            parallel=parallel,
-            categories=categories,
-        )
+        self._begin_run_log()
+        try:
+            run_crawl_jobs(
+                self.state,
+                self.config,
+                source=source,
+                max_items=max_items,
+                stop_event=stop_event,
+                pause_event=pause_event,
+                parallel=parallel,
+                categories=categories,
+            )
+        finally:
+            self._end_run_log()
+
+    # ------------------------------------------------------------------
+    # 每次爬取一个日志文件：<开始>至<结束>.log
+    # ------------------------------------------------------------------
+    def _begin_run_log(self) -> None:
+        if not self.run_log.enabled:
+            return
+        try:
+            report = self.run_log.check_previous()
+            errors = int(report.get("errors") or 0)
+            if errors:
+                names = report.get("files") or []
+                shown = "、".join(names[:3]) + ("…" if len(names) > 3 else "")
+                self.state.set_alert(
+                    RUN_LOG_ALERT_KEY,
+                    f"昨日（{report.get('date', '')}）爬取日志有 {errors} 处 ERROR"
+                    f"：{shown}（已保留，目录 {self.run_log.directory}）",
+                    level="error",
+                )
+            else:
+                self.state.clear_alert(RUN_LOG_ALERT_KEY)
+            removed = self.run_log.prune()
+            if removed:
+                logger.info(
+                    "已清理 %s 份过期日志（保留 %s 天、无 ERROR 的才删）：%s",
+                    len(removed),
+                    self.run_log.keep_days,
+                    "、".join(removed[:3]) + ("…" if len(removed) > 3 else ""),
+                )
+            path = self.run_log.start()
+            if path:
+                logger.info("本次爬取日志：%s", path.name)
+        except Exception:
+            logger.exception("初始化每日运行日志失败（不影响爬取）")
+
+    def _end_run_log(self) -> None:
+        if not self.run_log.enabled:
+            return
+        try:
+            path = self.run_log.finish()
+            if path:
+                logger.info("本次爬取结束，日志：%s", path.name)
+        except Exception:
+            logger.exception("收尾每日运行日志失败")
 
     def _upload_blocking(
         self,
@@ -1550,6 +1679,7 @@ def main() -> None:
     config = load_config(config_path)
     if args.output_dir:
         config["output_dir"] = str(args.output_dir)
+    _setup_logging(config)
 
     output_dir = Path(config["output_dir"]).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
