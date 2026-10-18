@@ -2,11 +2,33 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from datetime import date
+from functools import wraps
 
 from flask import Flask, jsonify, render_template_string, request
 
 from crawl_ccdi_regulations import CCDI_CATEGORY_PATHS
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_api(name: str):
+    """接口兜底：任何异常都转成 JSON 错误，别让一次请求把整个 UI 线程带崩。"""
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("接口 %s 处理失败", name)
+                return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+        return wrapper
+
+    return decorator
 
 
 def _ccdi_category_rows(snap: dict) -> list[dict]:
@@ -1273,6 +1295,7 @@ def create_monitor_app(controller) -> Flask:
         )
 
     @app.get("/api/status")
+    @_safe_api("status")
     def api_status():
         state = controller.state
         # 终端里跑的单次任务会写同一个状态文件，这里先热重载以保证 UI 实时同步
@@ -1320,6 +1343,7 @@ def create_monitor_app(controller) -> Flask:
         )
 
     @app.get("/api/files")
+    @_safe_api("files")
     def api_files():
         """爬取文件列表：支持分页、按列排序。"""
         controller.state.reload()
@@ -1442,6 +1466,7 @@ def create_monitor_app(controller) -> Flask:
         return jsonify({"cleared": bool(key)})
 
     @app.get("/api/agent_status")
+    @_safe_api("agent_status")
     def api_agent_status():
         return jsonify(controller.agent_status())
 
@@ -1464,16 +1489,24 @@ def create_monitor_app(controller) -> Flask:
 
 
 def run_monitor_server(controller, host: str, port: int) -> None:
+    """监控 Web 服务：跑在独立线程里，崩了自动重建，永远不影响爬取/上传。"""
     app = create_monitor_app(controller)
-    try:
-        app.run(host=host, port=port, threaded=True, use_reloader=False)
-    except OSError as exc:
-        logger.error(
-            "监控 UI 启动失败：%s:%s 无法监听（%s）。"
-            "很可能已有一个旧进程占着这个端口（用 `ss -ltnp | grep %s` 查一下），"
-            "先结束旧进程再启动；本进程会继续按定时任务运行，但浏览器里看到的仍是旧进程的界面。",
-            host,
-            port,
-            exc,
-            port,
-        )
+    while True:
+        try:
+            app.run(host=host, port=port, threaded=True, use_reloader=False)
+            logger.warning("监控 UI 服务已退出，30 秒后重新启动")
+        except SystemExit:
+            raise
+        except OSError as exc:
+            logger.error(
+                "监控 UI 启动失败：%s:%s 无法监听（%s）。"
+                "很可能已有一个旧进程占着这个端口（用 `ss -ltnp | grep %s` 查一下），"
+                "先结束旧进程；本进程会继续按定时任务运行，30 秒后自动重试监听。",
+                host,
+                port,
+                exc,
+                port,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("监控 UI 异常退出，30 秒后重启（爬取/上传不受影响）")
+        time.sleep(30)
