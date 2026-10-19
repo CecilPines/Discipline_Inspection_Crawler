@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import signal
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -27,15 +28,22 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
-from crawl_bit_jwjc_regulations import crawl_bit_jwjc_regulations
+from crawl_bit_jwjc_regulations import (
+    BIT_INDEX,
+    _fetch_html,
+    _parse_declared_total,
+    crawl_bit_jwjc_regulations,
+)
 from crawl_ccdi_regulations import (
     THROTTLE_ALERT_KEY,
     THROTTLE_ALERT_TEXT,
+    _estimate_all_data_total,
     crawl_ccdi_by_id,
     crawl_ccdi_regulations,
 )
 from crawl_common import (
     DEFAULT_USER_AGENTS,
+    PlaywrightPdfExporter,
     load_config,
     resolve_bit_delay_range,
     resolve_detail_delay_range,
@@ -116,6 +124,10 @@ def _setup_logging(config: dict) -> None:
 # 中纪检被跳过的子分类的重试任务 id（由调度器执行）
 SKIPPED_RETRY_JOB_ID = "skipped_category_retry"
 THROTTLE_RETRY_JOB_ID = "ccdi_throttle_retry"
+FAILED_RETRY_JOB_ID = "ccdi_failed_retry"
+FAILED_ALERT_KEY = "ccdi_failed_ids"
+FAILED_RETRY_MINUTES = 30
+FAILED_RETRY_MAX_ROUNDS = 3
 RUN_LOG_ALERT_KEY = "daily_log_error"
 
 
@@ -145,6 +157,24 @@ def _clear_pid_file(path: Path) -> None:
             path.unlink()
     except OSError:
         pass
+
+
+def _install_signal_handlers(controller: "JobController") -> None:
+    """systemd stop / 关机收到 SIGTERM 时优雅结束：置停止位、让日志改名、状态落盘。"""
+
+    def _handle(signum, _frame):
+        logger.info("收到停止信号 %s，正在结束当前任务…", signum)
+        controller.request_stop()
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handle)
+        except (OSError, ValueError):
+            continue
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -220,10 +250,13 @@ def run_crawl_jobs(
     pause_event: threading.Event | None = None,
     parallel: bool = False,
     categories: list[str] | None = None,
+    retry_ids: list[int] | None = None,
+    retry_probe=None,
 ) -> None:
     """执行爬取环节。max_items 用于测试模式：每个来源最多爬取该数量。
     parallel=True 且同时爬取两个来源时，中纪检与校纪检并行执行。
     categories 仅用于中纪检：只爬取这些导航码（重试被跳过的子分类）。
+    retry_ids 仅用于中纪检：只重试这些失败编号，不动日常/首次运行的游标。
     """
     crawl_cfg = config.get("crawl", {})
     output_dir = Path(config["output_dir"])
@@ -271,6 +304,8 @@ def run_crawl_jobs(
                 "ccdi",
                 status="error",
                 message=f"异常中断：{reason}",
+                # 清掉上一轮的活动量，避免卡片把旧数字和错误混在一起
+                extra={"scanned": 0, "new_count": 0, "loaded": 0, "pending": False},
             )
             state.set_alert(
                 "crawl_error_ccdi",
@@ -281,6 +316,32 @@ def run_crawl_jobs(
         logger.info("中纪检完成，新增 %s 个", ccdi_new)
 
     def _run_ccdi_impl(mode: str, first_run_now: bool) -> int:
+        if retry_ids:
+            try:
+                id_walk_max = int(crawl_cfg.get("id_walk_max", 71069) or 71069)
+            except (TypeError, ValueError):
+                id_walk_max = 71069
+            return crawl_ccdi_by_id(
+                output_dir,
+                state,
+                headless=headless,
+                timeout_ms=timeout_ms,
+                request_delay_seconds=delay_range,
+                detail_page_delay_seconds=detail_delay_range,
+                max_id=id_walk_max,
+                turn_back_at=0,
+                stop_event=stop_event,
+                pause_event=pause_event,
+                pdf_scale=scale_ccdi,
+                browser_channel=browser_channel,
+                stealth=stealth,
+                user_agents=user_agents,
+                first_run=False,
+                retry_ids=list(retry_ids),
+                retry_probe=retry_probe,
+                throttle_wait_ranges=throttle_ranges,
+                throttle_max_rounds=throttle_rounds,
+            )
         if mode == "id_walk" and not categories and not max_items:
             # 按详情页编号枚举：不依赖类目翻页，规避翻页触发的拦截
             try:
@@ -321,6 +382,7 @@ def run_crawl_jobs(
                 stealth=stealth,
                 user_agents=user_agents,
                 first_run=first_run_now,
+                retry_probe=retry_probe,
                 throttle_wait_ranges=throttle_ranges,
                 throttle_max_rounds=throttle_rounds,
             )
@@ -372,6 +434,7 @@ def run_crawl_jobs(
                 "bit",
                 status="error",
                 message=f"异常中断：{reason}",
+                extra={"scanned": 0, "new_count": 0, "loaded": 0, "pending": False},
             )
             state.set_alert(
                 "crawl_error_bit",
@@ -455,6 +518,10 @@ class JobController:
         self._scheduler: BackgroundScheduler | None = None
         # 中纪检跳过分类的自动重试：已重试轮数（每次完整爬取后归零）
         self._retry_round = 0
+        # 失败编号（failed_ids）批量重试：已重试轮数
+        self._failed_round = 0
+        # 抢占式重试：爬取过程中收到重试请求时，主循环会在下一个编号前插队处理
+        self._retry_interrupt = threading.Event()
         # 每次爬取一个独立日志文件（logs/runs/<开始>至<结束>.log）
         run_log_cfg = ((config.get("logging", {}) or {}).get("run_log", {}) or {})
         run_log_dir = Path(str(run_log_cfg.get("dir") or "logs/runs"))
@@ -474,7 +541,10 @@ class JobController:
             "test_source": self.test_source,
             "full_test": self.full_test,
             "test_schedule_mode": self.test_schedule_mode,
-            "first_run_pending": self.state.is_first_run(),
+            # 编号已经扫到上限时不再显示「首次执行」（避免旧标记一直挂着）
+            "first_run_pending": (
+                self.state.is_first_run() and self._ccdi_id_walk_pending()
+            ),
             "upload_mode": self.upload_mode,
             "parallel": self.parallel,
             "crawl_interval_minutes": self.crawl_interval_minutes,
@@ -492,6 +562,9 @@ class JobController:
             "upload_strategy": self._upload_strategy(),
             "upload_interval_days": self._upload_interval_days(),
             "next_throttle_retry_at": self.next_throttle_retry_at(),
+            "failed_ids": self._failed_ids(),
+            "failed_retry_round": self._failed_round,
+            "next_failed_retry_at": self.next_failed_retry_at(),
             "playwright_headless": bool(crawl_cfg.get("playwright_headless", True)),
             "crawl_running": self._crawl_running,
             "upload_running": self._upload_running,
@@ -972,6 +1045,7 @@ class JobController:
         # 这里补上，保证那批被跳过的分类也能按间隔自动重试
         self.schedule_skipped_retry()
         self.schedule_throttle_retry()
+        self.schedule_failed_retry()
 
     def apply_schedule(self) -> None:
         """按当前配置重建每日定时任务；时间为空表示停用该任务。"""
@@ -1035,6 +1109,7 @@ class JobController:
                 pause_event=pause_event,
                 parallel=parallel,
                 categories=categories,
+                retry_probe=self._retry_probe,
             )
         finally:
             self._end_run_log()
@@ -1119,9 +1194,22 @@ class JobController:
         self.schedule_skipped_retry()
         # id_walk 方式没有"被跳过的子分类"，限流结束时靠这里安排 30 分钟后的自动重试
         self.schedule_throttle_retry()
+        # 有失败编号就开启失败批量重试（30 分钟一轮，最多 3 轮）
+        self.schedule_failed_retry()
         if not self.state.is_first_run():
             return
         need = {"ccdi", "bit"} if source == "all" else {source}
+        # 兜底：中纪检已凑够库总量也算跑完（旧版本可能没写 pass_done）
+        if "ccdi" in need and not self.state.is_pass_done("ccdi"):
+            snap = self.state.snapshot()
+            docs = snap.get("documents") or {}
+            ccdi_count = sum(1 for d in docs.values() if d.get("source") == "ccdi")
+            total = int(
+                ((snap.get("total_estimate") or {}).get("ccdi") or {}).get("value")
+                or 0
+            )
+            if total and ccdi_count >= total:
+                self.state.mark_pass_done("ccdi")
         if not all(self.state.is_pass_done(s) for s in need):
             return
         # 中纪检按编号方式：必须真的扫到编号上限，才算首次全量跑完。
@@ -1133,12 +1221,28 @@ class JobController:
             return
         self.state.set_first_run(False)
         self.state.reset_pass_done()
+        # 首次运行结束：清掉所有爬取重试任务与遗留的失败编号，断点不再参与续爬
+        self.cancel_skipped_retry(reason="首次运行已完成")
+        self.cancel_throttle_retry(reason="首次运行已完成")
+        self.cancel_failed_retry()
+        rec = self.state.get_id_walk_position("ccdi") or {}
+        if rec:
+            rec.update({"failed_ids": [], "failed_since": "", "turn_back_done": True})
+            last = int(rec.get("last_id") or 0)
+            rec["scanned_max"] = max(int(rec.get("scanned_max") or 0), last)
+            self.state.set_id_walk_position(
+                "ccdi", last, **{k: v for k, v in rec.items() if k != "last_id"}
+            )
         logger.info("首次运行已完整结束（%s 都跑完了），已清除「首次执行」标记", "、".join(sorted(need)))
 
     def _ccdi_id_walk_pending(self) -> bool:
         """按编号爬取时，编号还没扫到上限就返回 True。"""
         cfg = self.config.get("crawl", {}) or {}
         if str(cfg.get("crawl_mode") or "id_walk").strip().lower() != "id_walk":
+            return False
+        # 双向扫描已跑完（turn_back_done）就算全量结束——断点游标可能被重试写成
+        # 很小的编号（例如 6528），不能只凭 last_id 判断
+        if (self.state.get_id_walk_position("ccdi") or {}).get("turn_back_done"):
             return False
         try:
             ceiling = int(cfg.get("id_walk_max", 71069) or 71069)
@@ -1237,6 +1341,284 @@ class JobController:
             logger.exception("限流自动重试失败")
         finally:
             self._crawl_running = False
+
+    # ------------------------------------------------------------------
+    # 失败编号（failed_ids）批量重试：30 分钟一轮，最多 3 轮
+    # ------------------------------------------------------------------
+    def reconcile_startup(self) -> bool:
+        """启动对账：两个来源都齐了就直接清掉「首次执行」与所有续爬/重试状态。"""
+        snap = self.state.snapshot()
+        docs = snap.get("documents") or {}
+        ccdi = sum(1 for d in docs.values() if d.get("source") == "ccdi")
+        bit = sum(1 for d in docs.values() if d.get("source") == "bit")
+        ccdi_total = int(
+            ((snap.get("total_estimate") or {}).get("ccdi") or {}).get("value") or 0
+        )
+        # 重新按页码算一遍中纪检总数（缓存值可能已经过时）
+        crawl_cfg = self.config.get("crawl", {}) or {}
+        try:
+            with PlaywrightPdfExporter(
+                headless=bool(crawl_cfg.get("playwright_headless", True)),
+                timeout_ms=int(crawl_cfg.get("page_load_timeout_ms", 120_000)),
+                pdf_scale=float(crawl_cfg.get("pdf_scale_ccdi", 1.0)),
+                browser_channel=crawl_cfg.get("browser_channel") or None,
+                stealth=bool(crawl_cfg.get("stealth", True)),
+                user_agents=list(DEFAULT_USER_AGENTS),
+            ) as exporter:
+                fresh = _estimate_all_data_total(exporter)
+            if fresh:
+                ccdi_total = int(fresh)
+                self.state.set_total_estimate("ccdi", ccdi_total)
+                logger.info("启动对账：中纪检总数重算为 %s 条", ccdi_total)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("启动对账：中纪检总数重算失败（改用缓存值 %s）：%s", ccdi_total, exc)
+        bit_total = None
+        try:
+            bit_total = _parse_declared_total(_fetch_html(BIT_INDEX))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("启动对账：校纪检目录读取失败：%s", exc)
+        if bit_total is None:
+            # 读不到就退回上次记录的总数，避免因为一次网络抖动导致对账不通过
+            bit_total = self.state.get_source_total("bit") or 0
+        logger.info(
+            "启动对账：中纪检 %s/%s，校纪检 %s/%s",
+            ccdi,
+            ccdi_total or "?",
+            bit,
+            bit_total if bit_total is not None else "?",
+        )
+        if not (ccdi_total and bit_total and ccdi >= ccdi_total and bit >= bit_total):
+            return False
+        self.state.set_first_run(False)
+        self.state.reset_pass_done()
+        self.cancel_skipped_retry(reason="启动对账已完成")
+        self.cancel_throttle_retry(reason="启动对账已完成")
+        self.cancel_failed_retry()
+        rec = self.state.get_id_walk_position("ccdi") or {}
+        if rec:
+            rec.update({"failed_ids": [], "failed_since": "", "turn_back_done": True})
+            last = int(rec.get("last_id") or 0)
+            rec["scanned_max"] = max(int(rec.get("scanned_max") or 0), last)
+            self.state.set_id_walk_position(
+                "ccdi", last, **{k: v for k, v in rec.items() if k != "last_id"}
+            )
+        logger.info("启动对账：数据已齐全，已清除「首次执行」标记与全部续爬/重试状态")
+        return True
+
+    def _failed_ids(self) -> list[int]:
+        rec = self.state.get_id_walk_position("ccdi") or {}
+        out: list[int] = []
+        for item in rec.get("failed_ids") or []:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        if out:
+            # 已经达到库总量：遗留的失败编号多半是无效网址，不再安排重试
+            snap = self.state.snapshot()
+            docs = snap.get("documents") or {}
+            count = sum(1 for d in docs.values() if d.get("source") == "ccdi")
+            total = int(
+                ((snap.get("total_estimate") or {}).get("ccdi") or {}).get("value")
+                or 0
+            )
+            if total and count >= total:
+                return []
+        return sorted(set(out))
+
+    def _retry_probe(self) -> list[int]:
+        """主循环每个编号前调用：有抢占式重试请求就返回失败编号列表。"""
+        if not self._retry_interrupt.is_set():
+            return []
+        self._retry_interrupt.clear()
+        return self._failed_ids()
+
+    def next_failed_retry_at(self) -> str | None:
+        return self._next_run_at(FAILED_RETRY_JOB_ID)
+
+    def cancel_failed_retry(self) -> None:
+        if self._scheduler is not None and self._scheduler.get_job(FAILED_RETRY_JOB_ID):
+            self._scheduler.remove_job(FAILED_RETRY_JOB_ID)
+
+    def schedule_failed_retry(
+        self, *, minutes: int | None = None, from_now: bool = False
+    ) -> None:
+        """有失败编号就安排 30 分钟后的批量重试；没有就关掉开关。"""
+        ids = self._failed_ids()
+        if not ids:
+            self.cancel_failed_retry()
+            self._failed_round = 0
+            self.state.clear_alert(FAILED_ALERT_KEY)
+            return
+        if self._scheduler is None:
+            return
+        if self._scheduler.get_job(FAILED_RETRY_JOB_ID):
+            return
+        if self._failed_round >= FAILED_RETRY_MAX_ROUNDS:
+            logger.warning(
+                "失败编号已重试 %s 轮仍未成功，停止自动重试：%s",
+                self._failed_round,
+                ids[:10],
+            )
+            self._mark_failed_ids_alert(ids)
+            return
+        delay = FAILED_RETRY_MINUTES if minutes is None else max(0, minutes)
+        if from_now:
+            run_at = datetime.now() + timedelta(minutes=delay)
+        else:
+            rec = self.state.get_id_walk_position("ccdi") or {}
+            try:
+                base = datetime.fromisoformat(str(rec.get("failed_since") or ""))
+            except (TypeError, ValueError):
+                base = datetime.now()
+            run_at = base + timedelta(minutes=delay)
+            if run_at <= datetime.now():
+                run_at = datetime.now() + timedelta(minutes=1)
+        self._scheduler.add_job(
+            self.retry_failed_ids_job,
+            DateTrigger(run_date=run_at),
+            id=FAILED_RETRY_JOB_ID,
+            replace_existing=True,
+        )
+        logger.info(
+            "已安排失败编号重试：%s（%s 个，第 %s/%s 轮）",
+            run_at.strftime("%Y-%m-%d %H:%M:%S"),
+            len(ids),
+            self._failed_round + 1,
+            FAILED_RETRY_MAX_ROUNDS,
+        )
+
+    def _mark_failed_ids_alert(self, ids: list[int]) -> None:
+        shown = "、".join(str(i) for i in ids[:10]) + ("…" if len(ids) > 10 else "")
+        self.state.set_alert(
+            FAILED_ALERT_KEY,
+            f"中纪检有 {len(ids)} 个编号连续 {FAILED_RETRY_MAX_ROUNDS} 轮重试仍失败：{shown}"
+            "（可点「重试失败编号」手动再试）",
+            level="error",
+        )
+
+    def retry_failed_ids_job(self) -> None:
+        """定时触发：批量重试所有失败编号。"""
+        ids = self._failed_ids()
+        if not ids:
+            self.cancel_failed_retry()
+            return
+        if self._crawl_running or self._upload_running:
+            # 抢占式：让正在爬取的主循环在下个编号前插入失败编号重试
+            logger.info("失败编号重试：通知正在运行的主扫描插队处理")
+            self._retry_interrupt.set()
+            return
+        self._failed_round += 1
+        logger.info(
+            "开始第 %s/%s 轮失败编号重试：%s 个（%s）",
+            self._failed_round,
+            FAILED_RETRY_MAX_ROUNDS,
+            len(ids),
+            ids[:10],
+        )
+        self._run_failed_retry_blocking(ids)
+        remaining = self._failed_ids()
+        if not remaining:
+            logger.info("失败编号已全部重试成功，关闭失败重试开关")
+            self._failed_round = 0
+            self.state.clear_alert(FAILED_ALERT_KEY)
+            self.cancel_failed_retry()
+            return
+        if self._failed_round >= FAILED_RETRY_MAX_ROUNDS:
+            logger.warning("失败编号连续 %s 轮仍未成功：%s", self._failed_round, remaining)
+            self._mark_failed_ids_alert(remaining)
+            return
+        self.schedule_failed_retry()
+
+    def _run_failed_retry_blocking(self, ids: list[int]) -> None:
+        was_first = self.state.is_first_run()
+        # 首次运行期间：重试也走「边爬边每 15 秒批量上传」
+        batch_done = None
+        if was_first and self.upload_mode == "auto":
+            batch_done = self.start_first_run_uploader()
+        self._stop_event.clear()
+        self._pause_event.clear()
+        self._crawl_running = True
+        try:
+            run_crawl_jobs(
+                self.state,
+                self.config,
+                source="ccdi",
+                stop_event=self._stop_event,
+                pause_event=self._pause_event,
+                retry_ids=ids,
+            )
+        except Exception:
+            logger.exception("失败编号重试任务异常")
+        finally:
+            self._crawl_running = False
+            if batch_done is not None:
+                batch_done.set()
+        # 重试也可能补齐「首次运行」的最后一条：走一遍收尾并补上传
+        self._after_crawl("ccdi")
+        if was_first and not self.state.is_first_run() and self.upload_mode == "auto":
+            logger.info("首次运行已通过失败重试补齐，立即上传全部文件")
+            try:
+                self.upload_now_sync()
+            except Exception:
+                logger.exception("补齐后的自动上传失败")
+
+    def start_failed_retry_now(self) -> dict:
+        """UI「重试失败编号」：立即异步重试，结束后重新安排 30 分钟后的下一次。"""
+        ids = self._failed_ids()
+        if not ids:
+            raise RuntimeError("当前没有失败编号")
+        if self._crawl_running or self._upload_running:
+            # 抢占式：不另起任务，让主循环插队重试，重试完自动回到原编号
+            self._retry_interrupt.set()
+            logger.info("已通知正在运行的主扫描：插入失败编号重试")
+            return {"started": True, "queued": True, "count": len(ids)}
+        self.cancel_failed_retry()
+
+        def worker() -> None:
+            was_first = self.state.is_first_run()
+            batch_done = None
+            if was_first and self.upload_mode == "auto":
+                batch_done = self.start_first_run_uploader()
+            self._crawl_running = True
+            try:
+                run_crawl_jobs(
+                    self.state,
+                    self.config,
+                    source="ccdi",
+                    stop_event=self._stop_event,
+                    pause_event=self._pause_event,
+                    retry_ids=ids,
+                )
+            except Exception:
+                logger.exception("手动重试失败编号异常")
+            finally:
+                self._crawl_running = False
+                if batch_done is not None:
+                    batch_done.set()
+            self._after_crawl("ccdi")
+            if (
+                was_first
+                and not self.state.is_first_run()
+                and self.upload_mode == "auto"
+            ):
+                logger.info("首次运行已通过手动重试补齐，立即上传全部文件")
+                try:
+                    self.upload_now_sync()
+                except Exception:
+                    logger.exception("补齐后的自动上传失败")
+            remaining = self._failed_ids()
+            if not remaining:
+                self._failed_round = 0
+                self.state.clear_alert(FAILED_ALERT_KEY)
+                return
+            self.schedule_failed_retry(from_now=True)
+
+        self._stop_event.clear()
+        self._pause_event.clear()
+        self._crawl_running = True
+        threading.Thread(target=worker, daemon=True, name="failed-retry").start()
+        return {"started": True, "count": len(ids)}
 
     def upload_sync(self) -> None:
         """同步执行定时上传（按保留天数）。"""
@@ -1412,6 +1794,7 @@ class JobController:
         """终止所有任务（爬取 / 上传，含自动上传），并取消待执行的中纪检跳过分类重试。"""
         self.cancel_skipped_retry(reason="已终止所有任务")
         self.cancel_throttle_retry(reason="已终止所有任务")
+        self.cancel_failed_retry()
         if not (self._crawl_running or self._upload_running):
             self._pause_event.clear()
             # 状态文件仍显示运行中，说明任务在别的进程里（例如终端单次任务），
@@ -1435,6 +1818,11 @@ class JobController:
         self._pause_event.clear()  # 先解除暂停，让循环尽快执行终止检查
         self._stop_event.set()
         return {"stopped": True, "message": "已终止所有任务"}
+
+    def request_stop(self) -> None:
+        """外部信号（systemd stop / 关机）要求停止：解除暂停并置停止位。"""
+        self._pause_event.clear()
+        self._stop_event.set()
 
     def pause(self) -> dict:
         """暂停当前运行中的任务。"""
@@ -1687,6 +2075,7 @@ def main() -> None:
     state = CrawlerState(state_path)
     controller = JobController(state, config)
     controller.config_path = config_path
+    _install_signal_handlers(controller)
     controller.start_interval_scheduler()
 
     # 实例自检：同一输出目录若还有旧进程活着，界面很可能会端口冲突、看到旧状态
@@ -1715,6 +2104,11 @@ def main() -> None:
 
     # 首次运行标记：一旦开始就持久化，只有整轮爬完（两个来源都跑完）才清除。
     # 所以首次运行中途被中断，重启后仍然按"首次运行"继续。
+    # 启动先对账：两个来源都已经齐全时，直接清掉首次执行标记与续爬/重试状态。
+    try:
+        controller.reconcile_startup()
+    except Exception:
+        logger.exception("启动对账失败（不影响正常运行）")
     first_run = state.is_first_run() or not bool(
         state.snapshot().get("documents")
     )
@@ -1768,24 +2162,29 @@ def main() -> None:
         logger.info("已跳过定时任务（--no-schedule --no-ui：单次执行模式）")
 
     ran_work = False
-    if first_run and not args.no_auto_start:
-        logger.info("首次运行：全量爬取（边爬边批量上传），结束后收尾上传")
-        controller.mark_first_run(True)
-        batch_done = controller.start_first_run_uploader()
-        try:
-            controller.crawl_sync()
-        except Exception:
-            logger.exception("首次全量爬取失败")
-        finally:
-            batch_done.set()
-        ran_work = True
-    else:
-        if args.crawl_now:
-            controller.crawl_now_sync(source=args.source)
+    try:
+        if first_run and not args.no_auto_start:
+            logger.info("首次运行：全量爬取（边爬边批量上传），结束后收尾上传")
+            controller.mark_first_run(True)
+            batch_done = controller.start_first_run_uploader()
+            try:
+                controller.crawl_sync()
+            except Exception:
+                logger.exception("首次全量爬取失败")
+            finally:
+                batch_done.set()
             ran_work = True
-        if args.upload_now:
-            controller.upload_now_sync()
-            ran_work = True
+        else:
+            if args.crawl_now:
+                controller.crawl_now_sync(source=args.source)
+                ran_work = True
+            if args.upload_now:
+                controller.upload_now_sync()
+                ran_work = True
+    except KeyboardInterrupt:
+        # systemd stop / 关机发的 SIGTERM 也走这里：停止位已置上，直接退出
+        logger.info("收到停止信号，已中断当前任务，进程退出")
+        return
 
     if args.no_schedule and args.no_ui:
         if ran_work:
@@ -1798,7 +2197,8 @@ def main() -> None:
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
-        logger.info("收到退出信号")
+        logger.info("收到退出信号，正在关闭…")
+        controller.request_stop()
         if scheduler:
             scheduler.shutdown(wait=False)
 

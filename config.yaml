@@ -29,10 +29,10 @@ crawl:
   #   category = 按左侧导航逐个子分类翻页抓取（旧方式，测试模式有固定值时仍会用它）
   crawl_mode: "id_walk"
   # id_walk 方式扫描到哪个编号为止（实测最后一份法规约为 71069）
-  id_walk_max: 71069
+  id_walk_max: 71080
   # 正向扫到这个编号后，不再继续往前，而是从 id_walk_max 倒着往上补
-  # （先扫 1..6405，再从 71069 往下扫 71068、71067…；0 = 关闭，一直正向扫到上限）
-  id_walk_turn_back_at: 6405
+  # （先扫 1..7200，再从 71069 往下扫 71068、71067…；0 = 关闭，一直正向扫到上限）
+  id_walk_turn_back_at: 7110
   # 日常增量：新发布的法规编号一定更大，每天从上次扫到的编号往后探测这么多个编号
   # （400 个约 20 分钟，足够覆盖一天的新增内容）。
   id_walk_daily_span: 400
@@ -93,8 +93,8 @@ crawl:
 
 # 定时任务（24 小时制）
 schedule:
-  crawl_time: "02:00"
-  upload_time: "03:30"
+  crawl_time: "06:00"
+  upload_time: "07:30"
   # 留空使用服务器本地时区，或填写 IANA 时区名，如 Asia/Shanghai
   timezone: "Asia/Shanghai"
 
@@ -113,7 +113,7 @@ upload:
 # RAGFlow（与 ragflow_kb_manager.py 中接口一致，可通过环境变量 RAGFLOW_API_KEY 覆盖）
 ragflow:
   base_url: "http://10.1.1.126:9222/api/v1"
-  api_key: "ragflow-MwODI0Y2U4YzlkOTExZjE5N2Y3YWVkMz"
+  api_key: "ragflow-Y4ZTAzZDkyY2I2MDExZjE4ZGI3OWUzMG"
   dataset_name_ccdi: "中纪检"
   dataset_name_bit: "校纪检"
   chunk_method: "laws"

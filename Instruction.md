@@ -390,10 +390,11 @@ echo $! > logs/app.pid
 每次爬取（每日定时、首次全量、UI 点「开始」、`--crawl-now`、自动重试都算）会单独一个文件：
 
 ```
-logs/runs/2026-10-18-09-00-00至2026-10-18-21-30-12.log
+logs/runs/20261019-10:33:11至20261019-10:50:11.log
 ```
 
-- 开始爬取时先建 `<开始>.log`，结束时关闭并把名字补成 `<开始>至<结束>.log`；
+- 格式是 `YYYYMMDD-HH:MM:SS`，两端用 `至` 连接；开始爬取时先建 `<开始>.log`，结束时关闭并把名字补成 `<开始>至<结束>.log`；
+- Windows 本地运行时冒号是非法文件名字符，会**自动**换成 `20261019-10-33-11至20261019-10-50-11.log`；旧格式（`2026-10-18-09-00-00至…`）仍能被识别和清理，只是不再新生成；
 - **下一次爬取开始前**检查「昨天」这一天的日志：
   - 有 `[ERROR]`（或未捕获异常的 `Traceback`）→ 界面顶部红色横幅「昨日（2026-10-17）爬取日志有 N 处 ERROR：xxx.log（已保留，目录 …）」，这些文件**永久保留**，不会被清理；
   - 没有 → 超过 `logging.run_log.keep_days`（默认 7 天）后自动删除；
@@ -463,9 +464,12 @@ User=bit
 WorkingDirectory=/home/bit/projects/Discipline_Inspection_Crawler
 Environment=PLAYWRIGHT_BROWSERS_PATH=/home/bit/projects/Discipline_Inspection_Crawler/.playwright-browsers
 Environment=RAGFLOW_API_KEY=ragflow-xxxxxxxx
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/bit/projects/Discipline_Inspection_Crawler/.venv/bin/python /home/bit/projects/Discipline_Inspection_Crawler/main.py
 Restart=always
 RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=60
 StandardOutput=append:/home/bit/projects/Discipline_Inspection_Crawler/logs/app.log
 StandardError=append:/home/bit/projects/Discipline_Inspection_Crawler/logs/app.log
 
@@ -482,6 +486,44 @@ systemctl status discipline-crawler
 ```
 
 > 注意：`Environment=` 的值不要加引号；若 systemd 版本较老不支持 `append:`，把两行 `StandardOutput/StandardError` 删掉，改用 `journalctl -u discipline-crawler -f` 看日志（此时日志在系统 journal 里，不在项目内）。
+
+**从 nohup 切换到 systemd（服务器重启后自动拉起）**
+
+`Restart=always` 管进程崩溃，`systemctl enable` 管开机自启，两个加起来就是"服务器重启 / 程序挂掉都会自动起来"。切换步骤：
+
+```bash
+cd ~/projects/Discipline_Inspection_Crawler
+
+# 1) 先停掉 nohup 那个进程，避免两个实例抢 8765
+kill $(cat logs/app.pid) 2>/dev/null
+pkill -f "python main.py" 2>/dev/null
+sleep 2
+ss -ltnp | grep 8765 || echo "8765 已释放"
+
+# 2) 确认 unit 里的路径、User、RAGFLOW_API_KEY 都对（见上面的 tee 命令）
+#    ExecStart 不要加 --crawl-now：定时任务会自己跑，重启时不必每次都触发一轮爬取
+
+# 3) 安装并启用
+sudo systemctl daemon-reload
+sudo systemctl enable --now discipline-crawler
+sudo systemctl status discipline-crawler --no-pager
+
+# 4) 验证
+ss -ltnp | grep 8765
+tail -f logs/app.log
+```
+
+程序收到 `systemctl stop` / 关机发的 `SIGTERM` 时会先置停止位、结束当前任务、把本次运行日志改名收尾，再退出（最多等 `TimeoutStopSec=60` 秒）。手动重启：
+
+```bash
+sudo systemctl restart discipline-crawler
+```
+
+确认开机自启：
+
+```bash
+systemctl is-enabled discipline-crawler      # 应输出 enabled
+```
 
 ### 3.7 两个环境变量必须处处一致
 
@@ -524,6 +566,57 @@ sudo systemctl restart discipline-crawler     # systemd 方式；tmux 方式则 
 - [ ] 再跑一次同样的爬取 → 新增应为 0（增量生效，不重复下载）。
 - [ ] 运行模式下「下一次爬取 / 下一次上传」时间符合预期；把某个时间留空 → 对应定时任务消失。
 - [ ] 服务器上进程稳定在跑（`systemctl status` / `tmux ls` / `tail -f logs/app.log`），日志没有反复报错。
+
+**随时统计已爬文件数量**
+
+项目根目录下的 `count_files.py` 只读统计 `output_dir` 里两个来源的文件数，不影响爬虫：
+
+```bash
+cd ~/projects/Discipline_Inspection_Crawler
+.venv/bin/python count_files.py              # 读 config.yaml 的 output_dir
+.venv/bin/python count_files.py --detail     # 再按「主分类 / 子分类」两级细分
+.venv/bin/python count_files.py --dir data/regulations   # 手动指定目录
+```
+
+输出示例：
+
+```
+输出目录：/home/bit/projects/Discipline_Inspection_Crawler/data/regulations
+中纪检：1234 个 PDF
+校纪检：93 个 PDF
+合计：1327 个 PDF
+（状态文件登记：中纪检 1234 · 校纪检 93）
+```
+
+如果磁盘数量和状态文件登记数对不上，脚本会多打一行「磁盘比登记多/少 N 个」，方便排查漏存或手工删文件。
+
+加 `--detail` 会按两级目录展开（中纪检是 `主分类 / 子分类`，校纪检是平铺的，会显示「直属文件」）：
+
+```
+中纪检 目录明细（主分类 / 子分类）：
+  党内法规制度：1100 个 PDF
+    党章：6 个 PDF
+    准则：4 个 PDF
+    ...
+  国家法律法规：134 个 PDF
+    宪法：19 个 PDF
+    法律：42 个 PDF
+    ...
+
+校纪检 目录明细（主分类 / 子分类）：
+  （直属文件）：93 个 PDF
+```
+
+**核对某个分类有没有漏爬**
+
+`find_missing_ccdi.py` 是独立脚本（只读，不影响爬虫）：打开指定分类页逐页解析标题，先按标题比对 `crawler_state.json`，标题带省略号或没命中时再打开详情页按编号核对，最后列出仍然缺失的条目。
+
+```bash
+.venv/bin/python find_missing_ccdi.py                       # 默认查「党内法规制度」
+.venv/bin/python find_missing_ccdi.py --json missing.json   # 结果存 JSON
+.venv/bin/python find_missing_ccdi.py --max-pages 3 --limit-details 1   # 快速调试
+.venv/bin/python find_missing_ccdi.py --headed              # 遇到滑动验证时
+```
 
 ## 5. 日常运维
 
@@ -601,6 +694,7 @@ curl -s http://<host>:<port>/api/v1/datasets -H "Authorization: Bearer <key>" | 
 **文件是怎么命名的？和网页上的条目怎么对应？**
 
 - **中纪检**：`子分类[序号] 标题.pdf`，例如 `党章[1] 中国共产党章程.pdf`、`条例[12] 中国共产党党组工作条例.pdf`。序号是该条目在**这个子分类列表里的位置**（第 1 页第 1 条 = 1，跨页连续），每个子分类各自从 1 开始。
+  - 分类缺失时：只有一级分类 → `主分类/其他/其他[序号] 标题.pdf`；一级二级都没有 → `其他/[序号] 标题.pdf`。子分类进度面板会多出 `党内法规制度/其他`、`国家法律法规/其他`、`其他（未归类）` 三行，总数用减法算（一级其他 = 全部总数 − 两个一级目录总数；二级其他 = 一级总数 − 各二级总数之和），量不到一级总数时显示 `—`。
 - **校纪检**：`[序号] 标题.pdf`，例如 `[17] 党政机关厉行节约反对浪费条例.pdf`。序号是整站 `法规制度` 列表的顺序（每页 8 条，所以 `index2.htm` 第 1 条是 17），可以逐条对照网页。
 - 标题取的是列表页上显示的链接文字；Windows 不允许的字符会换成全角（`:`→`：`、`?`→`？`、`/`→`／`），英文双引号按开合换成中文引号（`"带病提拔"` → `“带病提拔”`），换行压成空格，其余保持原样。
 - **已存在的文件不会改名**，编号只对之后新下载的文件生效；UI 的「历史记录」只显示标题本身，不带编号前缀。
@@ -633,6 +727,18 @@ curl -s http://<host>:<port>/api/v1/datasets -H "Authorization: Bearer <key>" | 
 **`/api/status` 报 `RuntimeError: dictionary changed size during iteration`？**
 
 旧版本的状态文件读写没有加锁：UI 线程每秒 `deepcopy` 一次状态，而爬虫/上传线程同时在往 `documents` 里加记录，就会撞出这个异常（只影响那一次 `/api/status` 请求，状态文件本身没坏）。现在 `CrawlerState` 的所有读写方法都加了同一把可重入锁（`crawler_state.py` 里的 `_locked`），`snapshot()` 的 `deepcopy` 不会再有并发写入。升级后重启进程即可；不需要删 `crawler_state.json`。
+
+**日志里出现 `TargetClosedError: Page.goto: Target page, context or browser has been closed`？**
+
+说明 Chromium（或 Playwright driver）在爬取途中被关掉了。现在程序会自愈：捕获 `BrowserConnectionClosed` 后**重启浏览器，并从当前编号重试**——
+
+- 导航时断开 → 重开这一页；
+- 导出 PDF 时断开 → 删掉半截 PDF，重启后重导这一条；
+- 单轮最多重启 5 次，仍失败才结束本轮（断点、已导出的文件都在）。
+
+卡片上会短暂显示「浏览器已断开，正在重启浏览器后继续…」，日志里是「编号 N：浏览器连接已断开，重启浏览器后继续（第 1/5 次）」。
+
+如果一直重启失败，再排查：`free -h`、`dmesg -T | grep -iE "oom|killed process"`（内存不足导致 Chromium 被杀），或把 `crawl.browser_channel` 留空改用 Playwright 自带 Chromium 试试。
 
 **关掉浏览器 / 断开 8765 页面，会影响爬取吗？**
 
@@ -697,24 +803,68 @@ ps -ef | grep "[m]ain.py"     # 有几个 main.py
 - `failed_ids` 里是上次打开/导出失败的编号，重启时会补试；
 - 每 20 个编号落一次盘，所以最多重复访问 20 个编号。
 
+**每日增量是怎么跑的（首次全量跑完之后）**
+
+1. **算总数**：打开「全部数据」首页（`https://www.ccdi.gov.cn/fgk/index`），用「(总页数-1)×每页条数 + 末页条数」算总数，跟上次保存的 `total_estimate.ccdi` 比。**没增加 → 本轮直接结束（0 新增）**，不抓任何详情页。
+2. **按年份高级检索**：总数增加了 → 打开 `https://www.ccdi.gov.cn/fgk/law_advancedsearch`，「发布日期」选**当前年份**，提交搜索，然后按结果页顺序往下爬，遇到已爬过的编号就停。
+3. **兜底一**：高级检索被滑动验证挡住 / 翻页失败 → 退回「全部数据」目录页扫描（遇到已爬过的编号就停）。
+4. **兜底二**：目录页也不可用 / 没有新增 → 按编号递增，从 `id_walk.ccdi.last_valid_id + 1` 开始探测 `crawl.id_walk_daily_span`（默认 400）个编号；目录页翻页异常时，用见到的最小编号往前补到 `last_valid_id`。
+5. `last_valid_id` 是**最大有效编号**，只在真正抓到有效页面时前进。第 4 步一路扫到停止值都没有新增，它就保持不变，第二天继续核对同一段。
+
+> 高级检索的提交会触发站点的人机验证（实测是「滑动拼图」）。headless 模式下过不去，程序会记一条日志并自动走第 3、4 步兜底，不会卡死。
+
+校纪检则是先读目录页上的 `共 N 条`（`<span class="gp-ib totalPage">`），和上次记录的数字（`source_totals.bit`）一样就整轮跳过；变了才抓列表和详情。
+
+**失败编号什么时候重试？**
+
+只有三类情况会进 `failed_ids`：页面打不开/读不到内容、PDF 导出失败、断点那条没落盘。页面提示「输入有误」的编号在重试时会被**移出失败列表**（说明这个编号本来就不存在）。
+
+- 爬取结束后只要 `failed_ids` 非空，就开启重试开关：以第一条失败的时间（`failed_since`）为基准，**每 30 分钟**批量重试一次，**最多 3 轮**；
+- 每轮只访问 `failed_ids` 里的编号，不动 `last_id` / `back_last_id` 等主游标；成功的移出、失败的保留；
+- 全部成功 → 关闭开关；3 轮后仍有失败 → 顶部红色横幅列出编号，卡片显示「第 3/3 轮」；
+- 卡片右侧「失败编号」卡片可以「展开编号」「收起编号」，也可以点「立即重试」马上跑一轮；
+- 如果这次重试补齐了首次运行的最后一条（累计达到 6444），会自动上传全部文件，并把「首次执行」切换成「日常执行」。
+
+**界面布局**
+
+中纪检卡片下方是左右两栏：左边「中纪检 · 子分类进度」，右边上下两张等高卡片——「上次区间 / 有效编号」和「失败编号」；窗口窄于 900px 时自动改成上下排列。运行模式里的只读「配置」是一个可点击展开/收起的折叠块。
+
 **双向扫描（`id_walk_turn_back_at`）**
 
-配置了 `crawl.id_walk_turn_back_at: 6405` 时，正向扫到 6405 号就掉头：从 `id_walk_max`（71069）往下扫 71068、71067…，直到累计已爬条数达到库总量（6444，取 `total_estimate.ccdi`），或者一直扫回 6406。两个边界的有效编号都会记下来：
+配置了 `crawl.id_walk_turn_back_at: 7200` 时，正向扫到 7200 号就掉头：从 `id_walk_max`（71069）往下扫 71068、71067…，直到累计已爬条数达到库总量（6444，取 `total_estimate.ccdi`），或者一直扫回 7201。两个边界的有效编号都会记下来：
 
 ```json
 "id_walk": {
   "ccdi": {
     "phase": "backward",
-    "last_id": 6405,              // 正向游标
-    "forward_last_valid": 6405,   // 6405 之前最后一个有效编号
+    "last_id": 7200,              // 正向游标
+    "forward_last_valid": 7200,   // 7200 之前最后一个有效编号
     "back_last_id": 70888,        // 倒爬游标（递减）
     "backward_last_valid": 6489,  // 倒爬停下时最后一个有效编号
+    "turn_back_at_used": 7200,    // 上次实际生效的正向边界
+    "max_id_used": 71069,         // 上次实际生效的倒爬起点
     "turn_back_done": true
   }
 }
 ```
 
 日志里会打一行「双向扫描结束：正向最后一个有效编号 …，倒爬最后一个有效编号 …（累计已爬 N 条…）」，卡片的结果文案里也会带上这两个数字。中途重启时：正向阶段从 `last_id + 1` 继续；已经进入倒爬阶段（`phase=backward`）则从 `back_last_id - 1` 继续，不会回到 71069 重来。
+
+中纪检卡片上还有一排「**上次区间**」小标签：
+
+`[上次区间]` `[正爬最大有效 7200]` `[倒爬最小有效 68560]` `[倒爬最大有效 71065]` `[最大有效编号 71065]`
+
+对应 `forward_last_valid` / `backward_last_valid` / `backward_max_valid` / `last_valid_id`。日常新增的编号落在 `[正爬最大有效, 倒爬最小有效]` 空档或 `[倒爬最大有效, +∞)` 时按新增处理，并更新对应边界（离哪边近就往哪边扩）。
+
+**首次运行中途改了 `id_walk_turn_back_at` / `id_walk_max`？**
+
+重启时会对比状态里的 `turn_back_at_used` / `max_id_used` 和当前配置：
+
+- `id_walk_turn_back_at` 变大 → 先把「原正向游标 + 1 ~ 新值」补扫一遍；
+- `id_walk_max` 变大 → 再把「新上限 ~ 旧上限 + 1」倒着补一遍；
+- 然后**回到原来的倒爬位置**继续往下。
+
+举例：原来正向到 6405、倒爬停在 68554；把配置改成正向 7200、上限 71069，重启后顺序是 `6406~7200` → `68553` 继续往下。补扫段不移动主游标，中途再断也能重来（已登记的编号直接跳过）。任何时候累计达到 6444 条就立即停止，并把首次运行标记为完成。
 
 倒爬在达到 6444 条时会提前停，此时 `6406 ~ backward_last_valid - 1` 这一段还没核对过；如果之后发现缺文件，把 `id_walk_turn_back_at` 调小（或把状态里 `turn_back_done` 改成 `false`、`back_last_id` 往后挪）可以再补一遍。
 

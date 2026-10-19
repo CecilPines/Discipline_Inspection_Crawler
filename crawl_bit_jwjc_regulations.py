@@ -54,11 +54,23 @@ class BitListItem:
     publish_date: str
 
 
-def _fetch_html(url: str) -> str:
-    resp = requests.get(url, headers=SESSION_HEADERS, timeout=60)
-    resp.raise_for_status()
-    resp.encoding = "utf-8"
-    return resp.text
+def _fetch_html(url: str, *, attempts: int = 4) -> str:
+    """抓列表页；DNS/连接类错误自动重试（校纪检偶发 Temporary failure in name resolution）。"""
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            resp = requests.get(url, headers=SESSION_HEADERS, timeout=60)
+            resp.raise_for_status()
+            resp.encoding = "utf-8"
+            return resp.text
+        except requests.RequestException as exc:
+            last_error = exc
+            logger.warning(
+                "校纪检页面读取失败（第 %s/%s 次）：%s", attempt, attempts, exc
+            )
+            if attempt < attempts:
+                time.sleep((5, 15, 30)[min(attempt - 1, 2)])
+    raise RuntimeError(f"校纪检页面读取失败（已重试 {attempts} 次）：{last_error}")
 
 
 def _list_page_urls(index_html: str | None = None) -> list[str]:
@@ -144,9 +156,9 @@ def _parse_declared_total(html: str) -> int | None:
         return None
 
 
-def collect_bit_items() -> tuple[list[BitListItem], int | None]:
+def collect_bit_items(index_html: str | None = None) -> tuple[list[BitListItem], int | None]:
     """返回 (全部条目, 页面声明的总数「共 N 条」)。"""
-    index_html = _fetch_html(BIT_INDEX)
+    index_html = index_html if index_html is not None else _fetch_html(BIT_INDEX)
     declared_total = _parse_declared_total(index_html)
     all_items: list[BitListItem] = []
     seen: set[str] = set()
@@ -191,8 +203,41 @@ def crawl_bit_jwjc_regulations(
     root.mkdir(parents=True, exist_ok=True)
     delay_range = normalize_seconds_range(request_delay_seconds, default=(1.0, 1.0))
 
+    state.set_progress("bit", status="running", message="正在检查目录页…", note="")
+    # 每日增量：先看目录页「共 N 条」有没有变化，没变就不抓详情页
+    index_html = _fetch_html(BIT_INDEX)
+    declared_total = _parse_declared_total(index_html)
+    stored_total = state.get_source_total("bit")
+    if (
+        max_items is None
+        and declared_total is not None
+        and stored_total is not None
+        and declared_total == stored_total
+    ):
+        logger.info(
+            "校纪检无更新：目录页声明 %s 条，与上次记录一致，跳过本轮",
+            declared_total,
+        )
+        # 检查很快，稍微停一下让界面轮询能看到"运行中"再结束
+        time.sleep(1.5)
+        state.set_progress(
+            "bit",
+            status="idle",
+            message=f"无更新（目录页共 {declared_total} 条，与上次一致）",
+        )
+        state.set_last_crawl("bit")
+        # 目录条数没变 = 这一轮校纪检也是完整核对过的，必须记 pass_done，
+        # 否则「首次执行」永远清不掉
+        state.mark_pass_done("bit")
+        return 0
+    if declared_total is not None and stored_total is not None:
+        logger.info(
+            "校纪检目录条数变化：%s -> %s，开始增量抓取",
+            stored_total,
+            declared_total,
+        )
     state.set_progress("bit", status="running", message="正在收集列表…", note="")
-    catalog_all, declared_total = collect_bit_items()
+    catalog_all, declared_total = collect_bit_items(index_html)
     # 站点列表顺序 → 编号（1 起），用于文件名前缀，方便和 index*.htm 上的顺序对照
     seq_by_slug = {item.slug: idx + 1 for idx, item in enumerate(catalog_all)}
     # 运行模式总数优先用页面直接显示的「共 N 条」，取不到时退回实际解析条数
@@ -308,6 +353,8 @@ def crawl_bit_jwjc_regulations(
         state.set_progress("bit", status="idle", message=f"已终止，本次新增 {new_count} 个")
     else:
         state.set_progress("bit", status="idle", message=f"完成，本次新增 {new_count} 个")
+        if declared_total is not None and max_items is None:
+            state.set_source_total("bit", declared_total)
         # 完整跑完一遍（首次运行据此判断能否收尾）
         state.mark_pass_done("bit")
     state.set_last_crawl("bit")

@@ -70,6 +70,70 @@ def _ccdi_category_rows(snap: dict) -> list[dict]:
                 "reason": entry.get("reason") or "",
             }
         )
+    # ---- 「其他」统计：一级/二级都用减法算 ----
+    main_totals: dict[str, int] = {}
+    for code, main_name in (
+        ("law_validity_01", "党内法规制度"),
+        ("law_validity_02", "国家法律法规"),
+    ):
+        entry = status.get(code) or {}
+        value = entry.get("total")
+        if isinstance(value, int):
+            main_totals[main_name] = value
+    subs_by_main: dict[str, list[int]] = {}
+    subs_count: dict[str, int] = {}
+    for main_cat, sub_cat, code in CCDI_CATEGORY_PATHS:
+        subs_count[main_cat] = subs_count.get(main_cat, 0) + 1
+        entry = status.get(code) or {}
+        value = entry.get("total")
+        if isinstance(value, int):
+            subs_by_main.setdefault(main_cat, []).append(value)
+
+    for main_name in ("党内法规制度", "国家法律法规"):
+        name = f"{main_name}/其他"
+        crawled = counts.get(name, 0)
+        total = None
+        totals = subs_by_main.get(main_name, [])
+        if (
+            main_name in main_totals
+            and len(totals) == subs_count.get(main_name, 0)
+        ):
+            total = max(0, main_totals[main_name] - sum(totals))
+        rows.append(
+            {
+                "code": f"other_{main_name}",
+                "main": main_name,
+                "sub": "其他",
+                "name": name,
+                "total": total,
+                "total_estimated": False,
+                "crawled": crawled,
+                # 「其他」是兜底目录，不参与"待爬/部分完成"判断，统一显示完成
+                "status": "done",
+                "derived": False,
+                "reason": "" if total is not None else "总数未知（缺一级目录统计）",
+            }
+        )
+
+    overall = ((snap.get("total_estimate") or {}).get("ccdi") or {}).get("value")
+    other_total = None
+    if isinstance(overall, int) and len(main_totals) == 2:
+        other_total = max(0, overall - sum(main_totals.values()))
+    crawled = counts.get("其他", 0)
+    rows.append(
+            {
+                "code": "other_root",
+                "main": "其他",
+                "sub": "",
+                "name": "其他（未归类）",
+                "total": other_total,
+                "total_estimated": False,
+                "crawled": crawled,
+                "status": "done",
+                "derived": False,
+                "reason": "",
+            }
+        )
     return rows
 
 
@@ -95,6 +159,35 @@ HTML_TEMPLATE = """
     .pc-title { font-size: 20px; font-weight: 700; letter-spacing: .5px; color: #111827; margin: 0 0 10px; }
     .pc-num { font-size: 26px; font-weight: 700; color: #111827; margin: 8px 0 2px; }
     .pc-msg { font-size: 13px; color: #6b7280; margin-top: 8px; word-break: break-word; }
+    /* 中纪检「上次区间」小标签 */
+    .range-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
+    .tag-range-label { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
+    .tag-range-fwd { background: #e0edff; color: #1d4ed8; border: 1px solid #c7ddfd; }
+    .tag-range-back { background: #f3e8ff; color: #7e22ce; border: 1px solid #e9d5ff; }
+    .tag-range-max { background: #dcfce7; color: #15803d; border: 1px solid #bbf7d0; }
+    .tag-failed { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+    .tag-noupdate { background: #ccfbf1; color: #0f766e; border: 1px solid #99f6e4; }
+    .mini-btn { padding: 3px 10px; border: 1px solid #fecaca; border-radius: 999px;
+      background: #fff1f2; color: #b91c1c; font-size: 12px; cursor: pointer; }
+    .mini-btn:hover:not(:disabled) { background: #ffe4e6; }
+    /* 中纪检：子分类进度 + 右侧两张卡片，等高排列 */
+    .ccdi-bottom { display: flex; gap: 16px; align-items: stretch; margin-bottom: 18px; }
+    .ccdi-cat-col { flex: 1 1 auto; min-width: 0; display: flex; }
+    .ccdi-cat-col > .card { flex: 1 1 auto; margin-bottom: 0; }
+    .ccdi-side { flex: 0 0 360px; display: flex; flex-direction: column; gap: 16px; }
+    .ccdi-side .card { margin-bottom: 0; }
+    .ccdi-side .card:last-child { flex: 1 1 auto; display: flex; flex-direction: column; }
+    .range-tags { border: 1px solid #e6ebf3; background: #fbfcfe; border-radius: 10px;
+      padding: 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .range-tags .tag { text-align: center; }
+    .range-tags .tag-range-label { grid-column: 1 / -1; text-align: left; }
+    .failed-actions { display: flex; gap: 8px; margin-top: 8px; }
+    .failed-ids { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; max-height: 190px; overflow: auto; }
+    .side-title { font-size: 15px; font-weight: 600; color: #111827; margin-bottom: 10px; }
+    @media (max-width: 900px) {
+      .ccdi-bottom { flex-direction: column; }
+      .ccdi-side { flex: 0 0 auto; }
+    }
     .pc-stop { position: absolute; top: 14px; right: 14px; width: 32px; height: 32px; font-size: 12px; }
     .pc-stop:hover:not(:disabled) { box-shadow: 0 4px 10px rgba(239,68,68,.28); }
     .stat { font-size: 24px; font-weight: 650; color: #111827; margin-top: 4px; }
@@ -221,6 +314,13 @@ HTML_TEMPLATE = """
     .tag-first { background: #fef3c7; color: #b45309; border: 1px solid #fde68a; }
     .tag-daily { background: #eef2f7; color: #475569; border: 1px solid #e2e8f0; }
     .config-view { margin-top: 12px; border-top: 1px dashed #e5e9f2; padding-top: 10px; }
+    .cfg-details { margin-top: 12px; }
+    .cfg-details > summary { cursor: pointer; font-size: 13px; color: #2563eb;
+      list-style: none; display: inline-flex; align-items: center; gap: 6px; user-select: none; }
+    .cfg-details > summary::-webkit-details-marker { display: none; }
+    .cfg-details > summary::before { content: "▸"; font-size: 12px; transition: transform .15s; }
+    .cfg-details[open] > summary::before { transform: rotate(90deg); }
+    .cfg-details > summary:hover { color: #1d4ed8; text-decoration: underline; }
     .cfg-row { display: flex; gap: 12px; font-size: 12px; padding: 2px 0; }
     .cfg-key { color: #6b7280; min-width: 260px; }
     .cfg-val { color: #111827; font-family: Consolas, "Courier New", monospace; word-break: break-all; }
@@ -289,7 +389,10 @@ HTML_TEMPLATE = """
         </label>
       </div>
       <div class="stat-row" id="run_schedule_info"></div>
-      <div class="config-view" id="run_config_view"></div>
+      <details class="cfg-details">
+        <summary>配置（只读，点击展开 / 收起）</summary>
+        <div class="config-view" id="run_config_view"></div>
+      </details>
     </div>
 
     <div class="mode-panel" id="panel_test" style="display:none">
@@ -382,7 +485,13 @@ HTML_TEMPLATE = """
   </div>
 
   <div class="grid" id="summary"></div>
-  <div id="category_panel"></div>
+    <div class="ccdi-bottom">
+      <div id="category_panel" class="ccdi-cat-col"></div>
+      <div class="ccdi-side">
+        <div class="card side-card" id="range_card"></div>
+        <div class="card side-card" id="failed_card"></div>
+      </div>
+    </div>
 
   <div class="card">
     <div class="card-head">
@@ -581,7 +690,7 @@ function setMode(mode) {
   uiMode = mode;
   applyVisual();
   if (agentFullApiKey) {
-    document.getElementById('agent_api_key').value = (mode === 'test') ? agentFullApiKey : agentMaskedApiKey;
+    document.getElementById('agent_api_key').value = agentFullApiKey;
   }
   saveSettings();
 }
@@ -689,6 +798,62 @@ function nextUploadLabel(s) {
   return fmtTime(s ? s.next_daily_upload_at : null);
 }
 
+// 中纪检上次各区间爬到哪：正向边界 / 倒爬起点与游标 / 最大有效编号
+function ccdiRangeInfo(iw) {
+  if (!iw || !iw.last_id) return '';
+  const tags = [];
+  const fwd = iw.forward_last_valid || 0;
+  const bmin = iw.backward_last_valid || 0;
+  const bmax = iw.backward_max_valid || 0;
+  if (fwd) tags.push('<span class="tag tag-range-fwd">正爬最大有效 ' + fwd + '</span>');
+  if (bmin) tags.push('<span class="tag tag-range-back">倒爬最小有效 ' + bmin + '</span>');
+  if (bmax) tags.push('<span class="tag tag-range-back">倒爬最大有效 ' + bmax + '</span>');
+  const maxValid = iw.last_valid_id || 0;
+  if (maxValid) {
+    tags.push('<span class="tag tag-range-max">最大有效编号 ' + maxValid + '</span>');
+  }
+  if (!tags.length) return '';
+  return '<div class="range-tags"><span class="tag tag-range-label">上次区间</span>'
+    + tags.join('') + '</div>';
+}
+
+let uiFailedOpen = false;
+let lastSettings = {};
+
+function toggleFailedIds() {
+  uiFailedOpen = !uiFailedOpen;
+  const el = document.getElementById('failed_card');
+  if (el) el.innerHTML = failedCardHtml(lastSettings);
+}
+
+// 右下列：失败编号总数 + 可展开的具体编号 + 立即重试
+function failedCardHtml(settings) {
+  const ids = settings.failed_ids || [];
+  let html = '<div class="side-title">失败编号</div>';
+  if (!ids.length) {
+    return html + '<div class="pc-msg">当前没有失败编号</div>';
+  }
+  html += '<div class="pc-msg">共 <b>' + ids.length + '</b> 个待重试</div>'
+    + '<div class="range-tags">'
+    + '<span class="tag tag-failed">' + ids.length + ' 个</span>'
+    + (settings.next_failed_retry_at
+        ? '<span class="tag tag-time next">下次 ' + esc(fmtTime(settings.next_failed_retry_at)) + '</span>'
+        : '<span class="tag tag-time">第 ' + (settings.failed_retry_round || 0) + '/3 轮</span>')
+    + '</div>';
+  html += '<div class="failed-actions">'
+    + '<button class="mini-btn" onclick="toggleFailedIds()">'
+    + (uiFailedOpen ? '收起编号' : '展开编号') + '</button>'
+    + '<button class="mini-btn" onclick="retryFailed()"'
+    + (settings.crawl_running ? ' disabled' : '') + '>立即重试</button>'
+    + '</div>';
+  if (uiFailedOpen) {
+    html += '<div class="failed-ids">'
+      + ids.map(i => '<span class="tag tag-failed">' + i + '</span>').join('')
+      + '</div>';
+  }
+  return html;
+}
+
 // 时间标签：next 用于“下一次”，默认用于“上一次”
 function timeTag(label, value, variant) {
   return '<span class="tag tag-time' + (variant ? ' ' + variant : '') + '">'
@@ -787,6 +952,15 @@ async function stopTop() {
   setCtlStatus(r.data.message || '已终止所有任务', false);
 }
 
+async function retryFailed() {
+  const r = await api('/api/retry_failed', { method: 'POST' });
+  if (!r.ok) {
+    setCtlStatus('重试失败编号失败：' + (r.data.error || r.status), true);
+    return;
+  }
+  setCtlStatus('已开始重试 ' + (r.data.count || '') + ' 个失败编号', false);
+}
+
 async function stopSource() {
   await stopTop();
 }
@@ -799,7 +973,8 @@ function renderAgentStatus(data) {
   agentFullApiKey = data.api_key || '';
   agentMaskedApiKey = data.api_key_masked || '';
   setInputValue('agent_base_url', data.base_url || '');
-  setInputValue('agent_api_key', (uiMode === 'test') ? agentFullApiKey : agentMaskedApiKey);
+  // 不论运行模式还是测试模式，API Key 都完整显示，方便直接核对/复制
+  setInputValue('agent_api_key', agentFullApiKey);
   setInputValue('agent_name_ccdi', data.dataset_name_ccdi || '');
   setInputValue('agent_name_bit', data.dataset_name_bit || '');
 
@@ -935,7 +1110,9 @@ function progressCard(title, p, lastCrawl, lastUpload, extra) {
     + ({running: '运行中', idle: '空闲', error: '异常中断'}[p.status] || p.status) + '</span>'
     + '<div class="pc-num">' + num + '</div>'
     + bar
-    + '<div class="pc-msg">' + esc(p.message || '') + '</div>'
+    + (/^(完成，本次新增 0 个（目录总数仍为|无更新（目录页共)/.test(p.message || '')
+        ? '<div class="pc-msg"><span class="tag tag-noupdate">无更新</span></div>'
+        : '<div class="pc-msg">' + esc(p.message || '') + '</div>')
     + activity
     + visit
     + note
@@ -1220,6 +1397,7 @@ async function refresh() {
   prevUploadRunning = uploadRunning;
   prevRunningAny = runningNow;
   const s = data.summary;
+  lastSettings = data.settings || {};
   const firstRun = data.settings ? !!data.settings.first_run_pending : false;
   const schedulerOff = data.settings && data.settings.scheduler_enabled === false;
   try {
@@ -1237,7 +1415,8 @@ async function refresh() {
       + esc(fmtTime(data.settings.next_throttle_retry_at)) + '</div>'
     : '';
   document.getElementById('summary').innerHTML =
-    progressCard('中纪检', s.progress.ccdi, s.last_crawl_time.ccdi, s.last_upload_time.ccdi, curCat + throttleNext)
+    progressCard('中纪检', s.progress.ccdi, s.last_crawl_time.ccdi, s.last_upload_time.ccdi,
+      curCat + throttleNext)
     + progressCard('校纪检', s.progress.bit, s.last_crawl_time.bit, s.last_upload_time.bit)
     + `<div class="card progress-card">
       <div class="pc-title">今日 / 总量</div>
@@ -1253,6 +1432,13 @@ async function refresh() {
     </div>`;
   const panel = document.getElementById('category_panel');
   if (panel) renderCategoryPanel(panel, categoryPanel(s));
+  const rangeCard = document.getElementById('range_card');
+  if (rangeCard) {
+    rangeCard.innerHTML = '<div class="side-title">上次区间 / 有效编号</div>'
+      + (ccdiRangeInfo(s.id_walk_ccdi) || '<div class="pc-msg">暂无记录</div>');
+  }
+  const failedCard = document.getElementById('failed_card');
+  if (failedCard) failedCard.innerHTML = failedCardHtml(data.settings || {});
 }
 
 // 子分类面板每秒都会刷新：内容没变就不重建；要重建时保留滚动位置与折叠状态，
@@ -1336,6 +1522,8 @@ def create_monitor_app(controller) -> Flask:
                     "skipped_retry_at": controller.next_skipped_retry_at(),
                     "categories_ccdi": _ccdi_category_rows(snap),
                     "current_category": progress["ccdi"].get("category", ""),
+                    # 中纪检上次各区间爬到哪（正向边界 / 倒爬起点与游标 / 最大有效编号）
+                    "id_walk_ccdi": (snap.get("id_walk", {}) or {}).get("ccdi", {}) or {},
                 },
                 "settings": settings,
                 "alerts": state.list_alerts(),
@@ -1446,8 +1634,17 @@ def create_monitor_app(controller) -> Flask:
             return jsonify({"error": str(exc)}), 409
 
     @app.post("/api/stop")
+    @_safe_api("stop")
     def api_stop():
         return jsonify(controller.stop_all())
+
+    @app.post("/api/retry_failed")
+    @_safe_api("retry_failed")
+    def api_retry_failed():
+        try:
+            return jsonify(controller.start_failed_retry_now())
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
 
     @app.post("/api/pause")
     def api_pause():

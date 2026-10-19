@@ -54,6 +54,7 @@ class CrawlerState:
             "throttle_state": {},
             "pass_done": {},
             "total_estimate": {},
+            "source_totals": {},
             "first_run_pending": False,
             "documents": {},
         }
@@ -432,6 +433,23 @@ class CrawlerState:
         if rec.get("pdf_path") != pdf_path:
             rec["pdf_path"] = pdf_path
             self.save()
+
+    @_locked
+    def set_source_total(self, source: str, value: int) -> None:
+        """记录来源目录页声明的总条数（如校纪检「共 N 条」），用于判断有没有更新。"""
+        data = self._data.setdefault("source_totals", {})
+        data[source] = {"value": int(value), "updated_at": _now_iso()}
+        self.save()
+
+    @_locked
+    def get_source_total(self, source: str) -> int | None:
+        rec = (self._data.get("source_totals") or {}).get(source)
+        if not isinstance(rec, dict):
+            return None
+        try:
+            return int(rec.get("value") or 0)
+        except (TypeError, ValueError):
+            return None
 
     @_locked
     def mark_uploaded(self, doc_key: str, dataset_id: str) -> None:

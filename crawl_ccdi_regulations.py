@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 CCDI_BASE = "https://www.ccdi.gov.cn/fgk/"
 CCDI_INDEX = CCDI_BASE + "index"
+CCDI_ADVANCED_SEARCH = CCDI_BASE + "law_advancedsearch"
 CCDI_DISPLAY_URL = CCDI_BASE + "law_display/{nid}"
 
 # (一级分类, 二级分类, 左侧导航点击码)
@@ -117,6 +118,8 @@ DEFAULT_THROTTLE_WAIT = DEFAULT_THROTTLE_WAIT_RANGES
 # 连续限流等待次数上限（默认 3）：每次成功后计数归零，
 # 所以「每 20~30 条限流一次」时每次都能重新拥有 3 次退避机会。
 DEFAULT_THROTTLE_ROUNDS = 3
+# 单轮爬取里浏览器意外关闭时最多重启几次（超过就结束本轮，重启程序可继续）
+BROWSER_RELAUNCH_LIMIT = 5
 THROTTLE_ALERT_KEY = "ccdi_throttle"
 THROTTLE_ALERT_TEXT = (
     "中纪检站点持续限流（「您的请求过于频繁」）：连续多次退避等待后仍被限流，"
@@ -1908,25 +1911,37 @@ def crawl_ccdi_regulations(
 
 
 def _parse_display_page(html: str) -> tuple[str, str, str] | None:
-    """解析 law_display 详情页 → (主分类, 子分类, 标题)；无效编号返回 None。"""
+    """解析 law_display 详情页 → (主分类, 子分类, 标题)；无效编号返回 None。
+
+    有效页但分类缺失时的兜底：
+    - 只有一级分类（例如「党内法规制度」）→ 子分类记为「其他」；
+    - 连一级分类都没有 → 主分类记为「其他」、子分类记为空串（文件名不带前缀）。
+    """
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(" ", strip=True)
     if "输入有误" in text[:300]:
         return None
     h2 = soup.select_one("div.flater_tab h2.tit") or soup.select_one("h2.tit")
     title = h2.get_text(" ", strip=True) if h2 else ""
+    if not title:
+        return None
     category = ""
     for div in soup.select("div[align=left]"):
         match = re.search(r"分类[：:]\s*(.+)", div.get_text(" ", strip=True))
         if match:
             category = match.group(1).strip()
             break
-    if not title or "-->" not in category:
-        return None
-    main_cat, _, sub_cat = category.partition("-->")
+    if "-->" in category:
+        main_cat, _, sub_cat = category.partition("-->")
+    else:
+        main_cat, sub_cat = category, ""
     main_cat, sub_cat = main_cat.strip(), sub_cat.strip()
-    if not main_cat or not sub_cat:
-        return None
+    if not main_cat:
+        # 连一级分类都没有 → 根目录下的「其他」，文件名 [序号] 标题
+        return "其他", "", title
+    if not sub_cat:
+        # 只有一级分类 → <主分类>/其他，文件名 其他[序号] 标题
+        return main_cat, "其他", title
     return main_cat, sub_cat, title
 
 
@@ -1939,6 +1954,154 @@ def _is_invalid_display_page(html: str) -> bool:
     except Exception:
         return False
     return "输入有误" in text[:300]
+
+
+def _scan_current_result_pages(
+    exporter: PlaywrightPdfExporter,
+    known_ids: set[int],
+    stop_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+    max_pages: int = 8,
+) -> tuple[list[int], int | None, str]:
+    """扫描「当前已打开的结果页」及其后续页，遇到已爬过的编号就停。
+
+    列表是从新到旧排列的，所以一旦遇到一个**已爬过的编号**就可以停：
+    剩下的一定更旧、也一定爬过了。
+
+    返回 ``(新编号列表, 本次见到的最小有效编号, 状态)``：
+    - 状态 ``"ok"``：翻页正常（新编号列表可能就是空的）；
+    - 状态 ``"failed"``：翻页失败或被拦截，结果不完整。
+    """
+    page = exporter.page
+    html = _read_list_html(page, stop_event) or ""
+    if not html:
+        return [], None, "failed"
+    if (
+        _is_error_page(page)
+        or _is_throttle_page(page)
+        or _is_maintenance_page(page)
+        or _is_verification_page(page)
+    ):
+        logger.warning("结果页被拦截/验证（%s），跳过检查", page.url)
+        return [], None, "failed"
+
+    pages = max(1, _parse_max_page(html))
+    new_ids: list[int] = []
+    seen: set[int] = set()
+    min_seen: int | None = None
+    status = "ok"
+    for page_num in range(1, min(pages, max_pages) + 1):
+        if stop_event and stop_event.is_set():
+            return new_ids, min_seen, "failed"
+        wait_while_paused(pause_event, stop_event)
+        if page_num > 1:
+            if not _goto_list_page_number(page, page_num, stop_event):
+                status = "failed"
+                break
+            html = _read_list_html(page, stop_event) or ""
+            if not html:
+                status = "failed"
+                break
+            if _is_error_page(page) or _is_throttle_page(page) or _is_maintenance_page(page):
+                logger.warning(
+                    "目录第 %s 页被拦截/维护（%s）", page_num, page.url
+                )
+                status = "failed"
+                break
+        items = _parse_list_items(html)
+        if not items:
+            logger.warning("目录第 %s 页没有解析到条目", page_num)
+            status = "failed"
+            break
+        duplicated = False
+        for item in items:
+            try:
+                nid = int(str(item.doc_id).strip())
+            except (TypeError, ValueError):
+                continue
+            min_seen = nid if min_seen is None else min(min_seen, nid)
+            if nid in known_ids:
+                duplicated = True
+                break
+            if nid not in seen:
+                seen.add(nid)
+                new_ids.append(nid)
+        logger.info(
+            "目录第 %s/%s 页：%s 条，累计新增候选 %s 个%s",
+            page_num,
+            pages,
+            len(items),
+            len(new_ids),
+            "（遇到已爬过的编号，停止翻页）" if duplicated else "",
+        )
+        if duplicated:
+            break
+    return new_ids, min_seen, status
+
+
+def _scan_index_listing(
+    exporter: PlaywrightPdfExporter,
+    known_ids: set[int],
+    stop_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+    max_pages: int = 8,
+) -> tuple[list[int], int | None, str]:
+    """打开「全部数据」目录首页，再按页扫描。"""
+    page = exporter.page
+    if not _safe_goto(page, CCDI_INDEX):
+        return [], None, "failed"
+    wait_while_paused(pause_event, stop_event)
+    _wait_category_list(page, stop_event, 0, True)
+    return _scan_current_result_pages(
+        exporter, known_ids, stop_event, pause_event, max_pages
+    )
+
+
+def _search_by_year(
+    exporter: PlaywrightPdfExporter,
+    year: int | str,
+    known_ids: set[int],
+    stop_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+    max_pages: int = 5,
+) -> tuple[list[int], int | None, str]:
+    """高级检索：把「发布日期」选成本年，搜索后按结果页扫描。"""
+    page = exporter.page
+    if not _safe_goto(page, CCDI_ADVANCED_SEARCH):
+        return [], None, "failed"
+    wait_while_paused(pause_event, stop_event)
+    try:
+        page.wait_for_selector("#fbrq", timeout=20_000)
+        has_year = page.evaluate(
+            "y => Array.from(document.querySelectorAll('#fbrq option'))"
+            ".some(o => (o.value || '').trim() === y)",
+            str(year),
+        )
+        page.select_option("#fbrq", str(year) if has_year else "all")
+        logger.info(
+            "高级检索：发布日期选 %s，提交搜索…",
+            year if has_year else "全部年份（页面没有该年份）",
+        )
+        # 站点页面引用了并不存在的 advsearch0()，只能直接提交表单
+        with page.expect_navigation(timeout=45_000):
+            page.evaluate("document.getElementById('searchFrom0').submit()")
+    except Exception as exc:
+        if is_browser_closed_error(exc):
+            raise BrowserConnectionClosed(str(exc)) from exc
+        logger.warning("高级检索提交失败：%s", exc)
+        return [], None, "failed"
+    time.sleep(1.5)
+    if _is_verification_page(page):
+        logger.warning(
+            "高级检索触发了滑动验证（headless 无法自动完成），改用目录页/编号方式"
+        )
+        return [], None, "captcha"
+    if _is_error_page(page) or _is_throttle_page(page) or _is_maintenance_page(page):
+        logger.warning("高级检索结果页被拦截（%s）", page.url)
+        return [], None, "failed"
+    return _scan_current_result_pages(
+        exporter, known_ids, stop_event, pause_event, max_pages
+    )
 
 
 def crawl_ccdi_by_id(
@@ -1961,10 +2124,14 @@ def crawl_ccdi_by_id(
     stealth: bool = True,
     user_agents: list[str] | None = None,
     first_run: bool = False,
+    retry_ids: list[int] | None = None,
+    retry_probe=None,
     throttle_wait_ranges: list | None = None,
     throttle_max_rounds: int = DEFAULT_THROTTLE_ROUNDS,
 ) -> int:
     """按 law_display/<N> 逐个编号访问并导出 PDF，返回本次新增数量。
+
+    retry_ids 给定时只重试这些编号（失败编号批量重试），不碰日常/首次运行的游标。
 
     - 编号有效 → 从详情页解析「分类 + 标题」，存为 `子分类[序号] 标题.pdf`；
     - 编号无效（页面提示「输入有误」）→ 跳过，不发额外请求；
@@ -2013,6 +2180,14 @@ def crawl_ccdi_by_id(
 
     record = state.get_id_walk_position("ccdi") or {}
     last_done_id = int(record.get("last_id") or 0)
+    # 「最大有效编号」：只随真正抓到有效页面而前进。日常增量从这里 +1 开始；
+    # 编号递增扫到上限却没有新增时，它保持不变（明天再核对同一段）。
+    try:
+        last_valid_id = int(record.get("last_valid_id") or 0)
+    except (TypeError, ValueError):
+        last_valid_id = 0
+    if last_valid_id <= 0:
+        last_valid_id = last_done_id
     last_seen_url = str(record.get("last_url") or "")
     # scanned_max：1~scanned_max 的编号都已经核对过（有效的已登记、无效的已确认没有）。
     # 重启后据此跳过旧编号，不再从 1 号重新访问。
@@ -2027,27 +2202,47 @@ def crawl_ccdi_by_id(
         except (TypeError, ValueError):
             continue
     failed_set = set(failed_ids)
+    failed_since = str(record.get("failed_since") or "")
+
+    def mark_failed(nid_: int) -> None:
+        """把编号记入失败列表；同时记下第一条失败出现的时间（供 30 分钟后重试用）。"""
+        nonlocal failed_since
+        if nid_ in failed_set:
+            return
+        failed_set.add(nid_)
+        failed_ids.append(nid_)
+        if len(failed_ids) > 200:
+            failed_set.discard(failed_ids.pop(0))
+        if not failed_since:
+            failed_since = datetime.now().replace(microsecond=0).isoformat()
+
+    retry_queue = sorted({int(i) for i in (retry_ids or [])})
+    retry_mode = bool(retry_queue)
     resume_note = ""
-    if start_id is not None:
+    if retry_mode:
+        start = retry_queue[0]
+        resume_note = f"失败编号批量重试：{len(retry_queue)} 个"
+    elif start_id is not None:
         start = max(1, int(start_id))
     elif last_done_id:
+        if bool(record.get("turn_back_done")) or last_done_id >= max_id:
+            # 全量扫描早就结束了：last_id 只是被某次重试写小的旧断点，不能当续爬点
+            start = max_id
+            resume_note = "全量扫描已完成，按日常维护检查总数"
         # 有断点就先核对断点这一号有没有真的完成（PDF 已登记且文件还在），
         # 完成则从下一号继续，没完成就重试这一号——不重扫更早的编号。
-        entry = known_by_nid.get(last_done_id)
-        if entry is not None and path_exists(entry[1]):
+        elif (entry := known_by_nid.get(last_done_id)) is not None and path_exists(
+            entry[1]
+        ):
             start = last_done_id + 1
             resume_note = f"断点 {last_done_id} 号已完成，从 {start} 号续爬"
         else:
             start = last_done_id
             resume_note = f"断点 {last_done_id} 号未完成，先重试这一号"
-            if last_done_id not in failed_set:
-                failed_set.add(last_done_id)
-                failed_ids.append(last_done_id)
+            mark_failed(last_done_id)
     else:
         start = 1
-    if failed_ids and min(failed_ids) < start:
-        # 上次没导出成功的编号在断点之前，从最小的那个再补一次
-        start = min(start, min(failed_ids))
+    # 失败编号已经由开头的「预重试队列」处理，这里不再把 start 拉回它们
     # 日常维护时新发布的文件编号一定比上次更大，所以探测范围要往后放开一段，
     # 而不是被固定的 id_walk_max 卡住；连续若干个编号都不存在就提前收手。
     try:
@@ -2084,6 +2279,51 @@ def crawl_ccdi_by_id(
         user_agents=user_agents,
     ) as exporter:
         page = exporter.page
+        relaunch_count = 0
+
+        def relaunch_browser(tag: str) -> bool:
+            """浏览器意外关闭时重启；返回 False 表示重启失败或次数过多。"""
+            nonlocal page, relaunch_count
+            if relaunch_count >= BROWSER_RELAUNCH_LIMIT:
+                logger.error(
+                    "%s：浏览器已重启 %s 次仍不可用，结束本轮（重启程序可继续）",
+                    tag,
+                    relaunch_count,
+                )
+                return False
+            relaunch_count += 1
+            logger.warning(
+                "%s：浏览器连接已断开，重启浏览器后继续（第 %s/%s 次）",
+                tag,
+                relaunch_count,
+                BROWSER_RELAUNCH_LIMIT,
+            )
+            state.set_progress(
+                "ccdi",
+                message=f"{tag}：浏览器已断开，正在重启浏览器后继续…",
+            )
+            try:
+                exporter.relaunch()
+                page = exporter.page
+                return True
+            except Exception:
+                logger.exception("%s：重启浏览器失败", tag)
+                return False
+
+        def measure_total(code: str) -> int | None:
+            """量子分类条数；浏览器断了就重启后补量一次。"""
+            try:
+                return _measure_category_total(exporter, code, stop_event, pause_event)
+            except BrowserConnectionClosed:
+                if not relaunch_browser(f"测量 {code}"):
+                    return None
+                try:
+                    return _measure_category_total(
+                        exporter, code, stop_event, pause_event
+                    )
+                except BrowserConnectionClosed:
+                    return None
+
         # 先把"正在估算"写进卡片：估算要访问首页 + 翻到最后一页，慢的时候不能毫无反馈
         # 首次运行可能连续跑好几天，这段时间里缓存不过期：中断重启时直接用
         # 上次算出来的总数，不必再去「全部数据」翻页重算。
@@ -2133,7 +2373,7 @@ def crawl_ccdi_by_id(
         exporter.prev_status = 0
         logger.info(
             "按编号爬取：%s（%s → %s，已登记 %s 条，库总量 %s 条%s）",
-            resume_note or "从 1 号开始全量扫描",
+            resume_note or f"从 {start} 号开始",
             start,
             ceiling,
             base,
@@ -2157,48 +2397,107 @@ def crawl_ccdi_by_id(
         # 日常维护：先比对子分类条数，没有缺口就不用扫编号。
         # 但如果上一轮还没扫到编号上限（首次全量没跑完就中断了），就别先花几分钟
         # 量 26 个子分类——直接接着扫，否则点「开始」后看起来像没反应。
-        sweep_complete = last_done_id >= max_id
-        if not first_run and sweep_complete:
-            for main_cat, sub_cat, code in CCDI_CATEGORY_PATHS:
-                value = _measure_category_total(
-                    exporter, code, stop_event, pause_event
+        # 双向扫描已经跑完（turn_back_done）也说明全量扫描结束——不能只看 last_id，
+        # 断点游标可能因为某次重试被写成了很小的编号
+        turn_back_done = bool(record.get("turn_back_done"))
+        sweep_complete = last_done_id >= max_id or turn_back_done
+        if first_run and sweep_complete and total and base >= total:
+            # 外部状态里可能还留着过期的「首次运行」标记；既然编号扫到了上限、
+            # 文件数也够了，就按日常维护走（先比总数，不直接扫编号）
+            logger.info(
+                "已登记 %s 条、编号已扫到 %s，按日常维护处理（首次运行标记视为过期）",
+                base,
+                max_id,
+            )
+            first_run = False
+        daily_mode = (not first_run) and sweep_complete and not retry_mode
+        if daily_mode:
+            # 1) 访问「全部数据」首页，用页码算出总数，和上次保存的对比
+            current_total = _estimate_all_data_total(
+                exporter, stop_event, pause_event
+            )
+            saved_total = state.get_total_estimate("ccdi", None) or 0
+            if current_total:
+                logger.info(
+                    "目录总数：%s 条（上次 %s 条）",
+                    current_total,
+                    saved_total or "无记录",
                 )
-                if value is not None:
-                    measured[code] = value
-            deficits = {
-                code: measured[code] - per_cat.get(f"{main}/{sub}", 0)
-                for main, sub, code in CCDI_CATEGORY_PATHS
-                if code in measured
-                and measured[code] > per_cat.get(f"{main}/{sub}", 0)
-            }
-            if not deficits and measured:
-                logger.info("日常检查：各子分类条数与目录一致，无需按编号补爬")
-                if measured:
-                    _save_category_totals(totals_path, measured)
+                state.set_total_estimate("ccdi", current_total)
+            if current_total and saved_total and current_total <= saved_total:
+                logger.info(
+                    "目录总数没有增加（%s → %s），本轮无新增",
+                    saved_total,
+                    current_total,
+                )
                 state.set_progress(
                     "ccdi",
                     status="idle",
-                    message=f"完成，本次新增 0 个（各子分类条数均已齐全，用时 {(time.time()-started_at)/60:.0f} 分钟）",
+                    current=done,
+                    total=total,
+                    message=f"完成，本次新增 0 个（目录总数仍为 {current_total} 条）",
+                    extra={"pending": False},
                 )
                 state.set_last_crawl("ccdi")
                 state.mark_pass_done("ccdi")
                 return 0
-            if not measured:
-                logger.warning(
-                    "日常检查：一个子分类条数都没量到（站点可能被拦），"
-                    "改为按编号继续向后探测，避免漏掉新文件"
+
+            # 2) 有增加 → 高级检索：发布日期选今年，按结果页顺序爬
+            new_ids, min_seen, listing_status = _search_by_year(
+                exporter,
+                datetime.now().year,
+                set(known_by_nid.keys()),
+                stop_event,
+                pause_event,
+            )
+            if not new_ids and listing_status in ("failed", "captcha"):
+                # 3) 检索不可用（常见：滑动验证）→ 退回「全部数据」目录页扫描
+                logger.info("高级检索不可用，改用「全部数据」目录页检查")
+                new_ids, min_seen, listing_status = _scan_index_listing(
+                    exporter, set(known_by_nid.keys()), stop_event, pause_event
                 )
-            if deficits:
-                logger.info(
-                    "日常检查：发现缺口 %s，从 %s 号开始向上补",
-                    "、".join(
-                        f"{c}(-{d})" for c, d in sorted(deficits.items())
-                    ),
-                    start,
+            if new_ids:
+                start = min(new_ids)
+                ceiling = max(new_ids)
+                resume_note = (
+                    f"目录页发现 {len(new_ids)} 条新条目"
+                    f"（编号 {start}~{ceiling}），按目录页顺序补爬"
                 )
+                logger.info(resume_note)
+            elif (
+                listing_status == "failed"
+                and min_seen is not None
+                and min_seen - 1 >= last_valid_id + 1
+            ):
+                # 2) 翻页出问题：从这次见到的最小号往前补，一直补到最大有效编号
+                start = last_valid_id + 1
+                ceiling = min_seen - 1
+                resume_note = (
+                    f"目录页翻页异常，改为补 {start}~{ceiling} 号"
+                    f"（从目录里见到的 {min_seen} 号往前倒推到 {last_valid_id} 号）"
+                )
+                logger.info(resume_note)
+            else:
+                # 3) 目录页没有新增（或打不开）→ 按编号从最大有效编号往后探测
+                # 起点不能低于已经扫过的游标（last_id），否则会把很早以前的编号当成"新增"重扫
+                start = max(last_valid_id, last_id) + 1
+                # 只探测 daily_span 这一段；不能拿 max_id 兜底，否则最大有效编号
+                # 离上限很远时会一口气扫几万个编号
+                ceiling = start + daily_span - 1
+                resume_note = (
+                    f"目录页没有新增，按编号从 {start} 号往后探测到 {ceiling} 号"
+                )
+                logger.info(resume_note)
+            state.set_progress(
+                "ccdi",
+                current=done,
+                total=total,
+                message=resume_note,
+                extra={"pending": False},
+            )
         elif not first_run:
             logger.info(
-                "上一轮只扫到 %s 号（上限 %s），跳过子分类条数比对，直接续扫",
+                "上一轮只扫到 %s 号（上限 %s），跳过目录检查，直接续扫",
                 last_done_id,
                 max_id,
             )
@@ -2223,15 +2522,31 @@ def crawl_ccdi_by_id(
             backward_last_valid = int(record.get("backward_last_valid") or 0)
         except (TypeError, ValueError):
             backward_last_valid = 0
+        try:
+            backward_max_valid = int(record.get("backward_max_valid") or 0)
+        except (TypeError, ValueError):
+            backward_max_valid = 0
+        try:
+            # 正向实际扫到过的最大编号（补扫段也会推进它，和断点游标 last_id 区分开）
+            forward_scanned_to = int(
+                record.get("forward_scanned_to") or last_done_id or 0
+            )
+        except (TypeError, ValueError):
+            forward_scanned_to = last_done_id
         phase = str(record.get("phase") or "")
         backward_mode = (
-            turn_back_at > 0
+            not retry_mode
+            and turn_back_at > 0
             and not turn_back_done
             and (last_done_id <= turn_back_at or phase == "backward")
         )
+        pending_ids = list(retry_queue) if retry_mode else []
         direction = 1
         nid = start
-        if backward_mode and phase == "backward":
+        if retry_mode:
+            # 只重试失败编号：不碰主游标，逐个处理 pending_ids
+            pass
+        elif backward_mode and phase == "backward":
             # 上次停在倒爬阶段：从更小的编号继续往下走
             direction = -1
             nid = (back_last_id - 1) if back_last_id else ceiling
@@ -2240,17 +2555,138 @@ def crawl_ccdi_by_id(
             )
         forward_end = turn_back_at if backward_mode else ceiling
         hit_target = False
+        reached_target = False
+        if retry_mode:
+            main_phase = "forward"
+            phase_kind = "retry"
+            current_end = start
+        else:
+            main_phase = "backward" if direction == -1 else "forward"
+            phase_kind = main_phase
+            current_end = forward_end if direction == 1 else turn_back_at
+        # 断点续跑：先把上次失败的编号重试一遍，再继续主流程
+        main_dir, main_nid, main_end = direction, nid, current_end
+        if total and base >= total and failed_ids and not retry_mode:
+            # 已经凑够库总量：剩下的"失败编号"基本都是无效网址，不再重试
+            logger.info(
+                "已登记 %s 条，达到库总量 %s，清空遗留的失败编号：%s",
+                base,
+                total,
+                failed_ids,
+            )
+            failed_ids.clear()
+            failed_set.clear()
+            failed_since = ""
+        elif not retry_mode and failed_ids:
+            pending_ids = sorted(set(failed_ids))
+            phase_kind = "retry"
+            logger.info(
+                "续跑前先重试失败编号 %s 个：%s", len(pending_ids), pending_ids[:10]
+            )
+
+        # ---- 配置改了怎么办：首次运行没跑完时补扫新增出来的区间 ----
+        # 例：原来正向到 6405、正在从 71069 倒爬；把正向改成 7200 →
+        #     先把 6406~7200 补上，再回到原来的倒爬位置继续往下。
+        #     把 id_walk_max 调大也一样：先补「新上限 ~ 旧上限」这一段。
+        segments: list[tuple[int, int, int]] = []  # (direction, start, end)
+        try:
+            prev_turn_back = int(record.get("turn_back_at_used") or last_done_id or 0)
+        except (TypeError, ValueError):
+            prev_turn_back = last_done_id
+        try:
+            prev_max = int(record.get("max_id_used") or max_id)
+        except (TypeError, ValueError):
+            prev_max = max_id
+        if first_run and backward_mode and main_phase == "backward":
+            if turn_back_at > prev_turn_back and turn_back_at > last_done_id:
+                segments.append((1, last_done_id + 1, turn_back_at))
+            if max_id > prev_max:
+                # 倒爬段的 end 是「到此为止（不含）」：处理到 prev_max+1 就停
+                segments.append((-1, max_id, prev_max))
+        if segments:
+            logger.info(
+                "检测到首次运行配置变化，先补扫：%s",
+                "、".join(
+                    f"{'正向' if d == 1 else '倒爬'} {s}~{e if d == 1 else e + 1}"
+                    for d, s, e in segments
+                ),
+            )
+            main_nid, main_end = nid, current_end
+            direction, nid, current_end = segments.pop(0)
+            phase_kind = "comp"
+        else:
+            main_nid, main_end = nid, current_end
 
         def note_position(position: int, *, valid: bool = False) -> None:
             """记录正向/倒爬两套游标，以及各自遇到的最后一个有效编号。"""
             nonlocal last_id, back_last_id, forward_last_valid, backward_last_valid
+            nonlocal last_valid_id, forward_scanned_to, backward_max_valid
+            if valid:
+                last_valid_id = max(last_valid_id, position)
+                if daily_mode:
+                    # 日常新增：按位置归入「正爬最大 / 倒爬最小 / 倒爬最大」三个边界
+                    old_fmax = forward_last_valid
+                    old_bmin = backward_last_valid
+                    old_bmax = backward_max_valid
+                    if old_bmax and position > old_bmax:
+                        backward_max_valid = position
+                        logger.info(
+                            "新增 %s 号落在 [倒爬最大有效 %s, +∞)，"
+                            "倒爬最大有效更新为 %s",
+                            position,
+                            old_bmax,
+                            position,
+                        )
+                    elif (
+                        old_fmax
+                        and old_bmin
+                        and old_fmax < position < old_bmin
+                    ):
+                        if position - old_fmax <= old_bmin - position:
+                            forward_last_valid = position
+                            logger.info(
+                                "新增 %s 号落在 [正爬最大 %s, 倒爬最小 %s] 空档，"
+                                "正爬最大有效更新为 %s",
+                                position,
+                                old_fmax,
+                                old_bmin,
+                                position,
+                            )
+                        else:
+                            backward_last_valid = position
+                            logger.info(
+                                "新增 %s 号落在 [正爬最大 %s, 倒爬最小 %s] 空档，"
+                                "倒爬最小有效更新为 %s",
+                                position,
+                                old_fmax,
+                                old_bmin,
+                                position,
+                            )
+                    else:
+                        logger.info(
+                            "新增 %s 号不在这两个重点区间内，三个边界保持不变",
+                            position,
+                        )
+                elif direction == -1:
+                    backward_max_valid = max(backward_max_valid, position)
+            if direction == 1:
+                if not daily_mode and phase_kind != "retry":
+                    forward_scanned_to = max(forward_scanned_to, position)
+            if phase_kind == "comp":
+                # 补扫段不移动主游标，只更新 last_valid_id（正向段顺带更新正向有效编号）
+                if valid and direction == 1 and not daily_mode:
+                    forward_last_valid = max(forward_last_valid, position)
+                return
+            if phase_kind == "retry":
+                # 失败编号重试：只更新 last_valid_id，不碰任何主游标
+                return
             if direction == 1:
                 last_id = max(last_id, position)
-                if valid:
+                if valid and not daily_mode:
                     forward_last_valid = max(forward_last_valid, position)
             else:
                 back_last_id = position if not back_last_id else min(back_last_id, position)
-                if valid:
+                if valid and not daily_mode:
                     # 倒着走，最后一次遇到的就是最小的有效编号
                     backward_last_valid = position
 
@@ -2260,12 +2696,18 @@ def crawl_ccdi_by_id(
                 last_id,
                 scanned_max=max(scanned_max, last_id),
                 failed_ids=failed_ids,
+                failed_since=failed_since or "",
                 last_url=last_seen_url,
                 back_last_id=back_last_id,
-                phase="backward" if direction == -1 else "forward",
+                phase=main_phase,
                 forward_last_valid=forward_last_valid,
                 backward_last_valid=backward_last_valid,
+                backward_max_valid=backward_max_valid,
+                last_valid_id=last_valid_id,
                 turn_back_done=turn_back_done,
+                turn_back_at_used=turn_back_at,
+                max_id_used=max_id,
+                forward_scanned_to=forward_scanned_to,
             )
 
         save_every = 20
@@ -2275,10 +2717,66 @@ def crawl_ccdi_by_id(
         # 首次运行必须老实扫到 max_id，不能因为中间大段空号就停。
         streak_base = max(scanned_max, last_done_id)
         while True:
-            if direction == 1 and nid > forward_end:
+            from_queue = False
+            if (
+                retry_probe is not None
+                and not pending_ids
+                and phase_kind != "retry"
+                and not retry_mode
+            ):
+                extra_ids = retry_probe()
+                if extra_ids:
+                    # 抢占式重试：记下当前编号，插队重试失败编号，完成后回到这里
+                    main_dir, main_nid, main_end = direction, nid, current_end
+                    pending_ids = sorted(set(int(i) for i in extra_ids))
+                    phase_kind = "retry"
+                    logger.info(
+                        "暂停主扫描（停在 %s 号），先重试失败编号 %s 个：%s",
+                        nid,
+                        len(pending_ids),
+                        pending_ids[:10],
+                    )
+            if pending_ids:
+                # 失败编号重试模式：按队列逐个处理
+                nid = pending_ids.pop(0)
+                direction = 1
+                from_queue = True
+            if not from_queue and phase_kind == "retry":
+                # 预重试队列处理完：独立重试任务到此结束，否则回到主流程
+                if retry_mode:
+                    break
+                phase_kind = main_phase
+                direction, nid, current_end = main_dir, main_nid, main_end
+                logger.info("失败编号预重试完成，继续主流程")
+                continue
+            if not from_queue and direction == 1 and nid > current_end:
+                if segments:
+                    direction, nid, current_end = segments.pop(0)
+                    phase_kind = "comp"
+                    logger.info(
+                        "继续补扫：%s %s~%s",
+                        "正向" if direction == 1 else "倒爬",
+                        nid,
+                        current_end,
+                    )
+                    continue
+                if phase_kind == "comp":
+                    # 补扫段结束 → 回到原来的主游标（例如倒爬停在 68554）
+                    phase_kind = main_phase
+                    direction = -1 if main_phase == "backward" else 1
+                    nid, current_end = main_nid, main_end
+                    logger.info(
+                        "补扫完成，回到主流程：%s %s 号继续",
+                        "倒爬" if direction == -1 else "正向",
+                        nid,
+                    )
+                    continue
                 if backward_mode:
+                    main_phase = "backward"
+                    phase_kind = "backward"
                     direction = -1
                     nid = (back_last_id - 1) if back_last_id else ceiling
+                    current_end = turn_back_at
                     logger.info(
                         "正向已扫到 %s 号（正向最后一个有效编号 %s），"
                         "改为从 %s 号倒着往上补",
@@ -2302,7 +2800,27 @@ def crawl_ccdi_by_id(
                     save_position()
                     continue
                 break
-            if direction == -1 and nid <= turn_back_at:
+            if not from_queue and direction == -1 and nid <= current_end:
+                if segments:
+                    direction, nid, current_end = segments.pop(0)
+                    phase_kind = "comp"
+                    logger.info(
+                        "继续补扫：%s %s~%s",
+                        "正向" if direction == 1 else "倒爬",
+                        nid,
+                        current_end,
+                    )
+                    continue
+                if phase_kind == "comp":
+                    phase_kind = main_phase
+                    direction = -1 if main_phase == "backward" else 1
+                    nid, current_end = main_nid, main_end
+                    logger.info(
+                        "补扫完成，回到主流程：%s %s 号继续",
+                        "倒爬" if direction == -1 else "正向",
+                        nid,
+                    )
+                    continue
                 break
             if stop_event and stop_event.is_set():
                 aborted = True
@@ -2325,7 +2843,15 @@ def crawl_ccdi_by_id(
                 key = known_entry[0]
 
             # 之前已经核对过、确认没有内容的编号，直接跳过，不再发请求
-            if direction == 1 and nid <= scanned_max and nid not in failed_set:
+            # （日常增量不跳：每天要把「最大有效编号」之后这一段重新核对一遍，
+            #  否则昨天扫过的空号会把今天新发布的文件一起跳过）
+            if (
+                direction == 1
+                and not daily_mode
+                and phase_kind not in ("comp", "retry")
+                and nid <= scanned_max
+                and nid not in failed_set
+            ):
                 note_position(nid)
                 nid += direction
                 continue
@@ -2346,17 +2872,27 @@ def crawl_ccdi_by_id(
                     extra=_visit_extras(exporter, pending_url=url),
                 )
                 nav_started = time.time()
-                if not _safe_goto(page, url, timeout_ms=45_000):
-                    # 慢响应/超时：退一步用 commit 方式再试，内容随后再读
-                    if not _safe_goto(
-                        page, url, timeout_ms=25_000, wait_until="commit"
-                    ):
-                        if not sleep_with_stop(
-                            RETRY_DELAY_SECONDS, stop_event, pause_event
-                        ):
-                            aborted = True
+                try:
+                    ok = _safe_goto(page, url, timeout_ms=45_000)
+                    if not ok:
+                        # 慢响应/超时：退一步用 commit 方式再试，内容随后再读
+                        ok = _safe_goto(
+                            page, url, timeout_ms=25_000, wait_until="commit"
+                        )
+                        if ok:
+                            time.sleep(2.0)
+                except BrowserConnectionClosed:
+                    # 浏览器被关掉/崩溃：重启后重试同一个编号
+                    if relaunch_browser(f"编号 {nid}"):
                         continue
-                    time.sleep(2.0)
+                    aborted = True
+                    break
+                if not ok:
+                    if not sleep_with_stop(
+                        RETRY_DELAY_SECONDS, stop_event, pause_event
+                    ):
+                        aborted = True
+                    continue
                 nav_seconds = time.time() - nav_started
                 if nav_seconds > 10:
                     logger.warning(
@@ -2409,15 +2945,18 @@ def crawl_ccdi_by_id(
             if parsed is None:
                 if _is_invalid_display_page(html):
                     # 站点明确说「输入有误」：这个编号确实没有文件
+                    # （重试时遇到这种编号算「已处理」，不再留在 failed_ids 里）
                     invalid_streak += 1
+                    if nid in failed_set:
+                        failed_set.discard(nid)
+                        failed_ids = [item for item in failed_ids if item != nid]
+                        if not failed_ids:
+                            failed_since = ""
+                        logger.info("编号 %s 确认为无效编号，从失败列表移除", nid)
                 else:
                     # 页面打开了但没读到内容（超时/空白）：记下来，下次运行再试
                     invalid_streak = 0
-                    if nid not in failed_set:
-                        failed_set.add(nid)
-                        failed_ids.append(nid)
-                        if len(failed_ids) > 200:
-                            failed_set.discard(failed_ids.pop(0))
+                    mark_failed(nid)
                 note_position(nid)
                 scanned += 1
                 nid += direction
@@ -2449,14 +2988,21 @@ def crawl_ccdi_by_id(
             if nid in failed_set:
                 failed_set.discard(nid)
                 failed_ids = [item for item in failed_ids if item != nid]
-            cat_path = f"{main_cat}/{sub_cat}"
+                if not failed_ids:
+                    failed_since = ""
+            # 分类缺失时的兜底：没有二级 → <主分类>/其他；一级二级都没有 →
+            # 根目录下的「其他」，文件名用 [序号]（不带子分类前缀）
+            cat_path = f"{main_cat}/{sub_cat}" if sub_cat else main_cat
             seq = per_cat.get(cat_path, 0) + 1
-            folder = root / main_cat / sub_cat
+            if sub_cat:
+                folder = root / main_cat / sub_cat
+                prefix = f"{sub_cat}[{seq}] "
+            else:
+                folder = root / main_cat
+                prefix = f"[{seq}] "
             # 文件名按 UTF-8 字节截断：Linux 单个文件名上限 255 字节，
             # 中文标题一长就会 OSError: File name too long（旧版本会整轮崩掉）。
-            candidate = folder / fit_filename(
-                f"{sub_cat}[{seq}] ", sanitize_filename(title)
-            )
+            candidate = folder / fit_filename(prefix, sanitize_filename(title))
             try:
                 if candidate.exists():
                     candidate = ensure_unique_path(candidate)
@@ -2468,23 +3014,23 @@ def crawl_ccdi_by_id(
                     exc,
                     len(candidate.name.encode("utf-8")),
                 )
-                if nid not in failed_set:
-                    failed_set.add(nid)
-                    failed_ids.append(nid)
-                    if len(failed_ids) > 200:
-                        failed_set.discard(failed_ids.pop(0))
+                mark_failed(nid)
                 note_position(nid)
                 nid += direction
                 continue
             except Exception as exc:
                 if is_browser_closed_error(exc):
-                    raise BrowserConnectionClosed(str(exc)) from exc
+                    # 导出时浏览器挂了：删掉半截 PDF，重启浏览器后重试这一条
+                    try:
+                        candidate.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    if relaunch_browser(f"编号 {nid} 导出"):
+                        continue
+                    aborted = True
+                    break
                 logger.exception("导出失败 编号 %s", nid)
-                if nid not in failed_set:
-                    failed_set.add(nid)
-                    failed_ids.append(nid)
-                    if len(failed_ids) > 200:
-                        failed_set.discard(failed_ids.pop(0))
+                mark_failed(nid)
                 note_position(nid)
                 nid += direction
                 continue
@@ -2536,15 +3082,18 @@ def crawl_ccdi_by_id(
             if since_save >= save_every:
                 save_position()
                 since_save = 0
-            # 倒爬阶段：文件数达到库总量（6444）就停，并记下此时的有效编号
-            if direction == -1 and total and done >= total:
-                hit_target = True
-                backward_last_valid = nid
+            # 累计文件数达到库总量（6444）就停：不管当前在补扫段还是倒爬段
+            # 不区分首次/重试：只要累计达到库总量就收尾（重试补齐最后一条也算）
+            if registered and total and done >= total:
+                reached_target = True
+                hit_target = direction == -1
+                if direction == -1:
+                    backward_last_valid = nid
                 logger.info(
-                    "倒爬在 %s 号达到库总量 %s 条，停止；倒爬最后一个有效编号 %s",
+                    "在 %s 号达到库总量 %s 条，首次运行到此结束（本次新增 %s 个）",
                     nid,
                     total,
-                    backward_last_valid,
+                    new_count,
                 )
                 save_position()
                 break
@@ -2554,6 +3103,7 @@ def crawl_ccdi_by_id(
             # 倒爬阶段结束（不论是否达到总量），整个编号区间都算覆盖过
             turn_back_done = True
             last_id = max(last_id, ceiling)
+            main_phase = "forward"
             logger.info(
                 "双向扫描结束：正向最后一个有效编号 %s，倒爬最后一个有效编号 %s"
                 "（累计已爬 %s 条%s）",
@@ -2562,6 +3112,12 @@ def crawl_ccdi_by_id(
                 done,
                 "，已达到库总量" if hit_target else "",
             )
+        if reached_target:
+            # 达到 6444 条即视为首次运行完成，后续按日常增量走
+            turn_back_done = True
+            last_id = max(last_id, max_id)
+            main_phase = "forward"
+            logger.info("累计达到库总量 %s 条，首次运行标记可注销", total)
         save_position()
         elapsed = (time.time() - started_at) / 60.0
         logger.info(
@@ -2577,7 +3133,7 @@ def crawl_ccdi_by_id(
         short_categories: list[str] = []
         if not aborted and not throttle_blocked:
             for main_cat, sub_cat, code in CCDI_CATEGORY_PATHS:
-                value = _measure_category_total(exporter, code, stop_event, pause_event)
+                value = measure_total(code)
                 if value is None:
                     continue
                 measured[code] = value
@@ -2605,6 +3161,25 @@ def crawl_ccdi_by_id(
                     )
             if measured:
                 _save_category_totals(totals_path, measured)
+            # 一级目录总数（用于界面上「其他」的减法统计）
+            for main_name, main_code in (
+                ("党内法规制度", "law_validity_01"),
+                ("国家法律法规", "law_validity_02"),
+            ):
+                main_total = measure_total(main_code)
+                if main_total is None:
+                    continue
+                state.set_category_status(
+                    "ccdi",
+                    main_code,
+                    main=main_name,
+                    sub="",
+                    status="done",
+                    total=main_total,
+                    total_estimated=False,
+                    reason="",
+                    page=1,
+                )
 
     if throttle_blocked:
         state.set_alert(THROTTLE_ALERT_KEY, THROTTLE_ALERT_TEXT, level="error")
@@ -2614,7 +3189,15 @@ def crawl_ccdi_by_id(
             f"；正向最后一个有效编号 {forward_last_valid or '无'}，"
             f"倒爬最后一个有效编号 {backward_last_valid or '无'}"
         )
-    if aborted:
+    if retry_mode:
+        remaining = len(failed_ids)
+        message = (
+            f"失败编号重试完成：成功 {max(0, len(retry_queue) - remaining)} 个，"
+            f"仍失败 {remaining} 个"
+        )
+        if remaining:
+            message += "（" + "、".join(str(i) for i in failed_ids[:8]) + "…）"
+    elif aborted:
         stop_at = back_last_id if direction == -1 else last_id
         message = f"已终止，本次新增 {new_count} 个（停在 {stop_at or '—'} 号）{boundary}"
     elif throttle_blocked:
@@ -2631,7 +3214,7 @@ def crawl_ccdi_by_id(
             )
         state.clear_alert(THROTTLE_ALERT_KEY)
         # 首次执行标记只有在「编号确实扫到上限」时才算跑完；否则中断重启后继续按首次运行处理。
-        if last_id >= max_id:
+        if last_id >= max_id or reached_target:
             state.mark_pass_done("ccdi")
         else:
             message += f"；编号还没扫到上限 {max_id}，保留「首次执行」标记"

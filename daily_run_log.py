@@ -9,22 +9,34 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
-TIME_FMT = "%Y-%m-%d-%H-%M-%S"
+# 形如 20261019-10:33:11。冒号在 Windows 上是非法文件名字符，
+# 所以 Windows 本地运行时自动退化成 20261019-10-33-11。
+TIME_FMT = "%Y%m%d-%H:%M:%S"
+WIN_TIME_FMT = "%Y%m%d-%H-%M-%S"
+# 旧版本命名（兼容解析/清理，不再新生成）
+LEGACY_TIME_FMT = "%Y-%m-%d-%H-%M-%S"
 SEP = "至"
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 
 
+def _time_format() -> str:
+    return WIN_TIME_FMT if os.name == "nt" else TIME_FMT
+
+
 def _parse_start(path: Path) -> datetime | None:
-    """从文件名里取开始时间（`2026-10-18-09-00-00至....log`）。"""
+    """从文件名里取开始时间，兼容新旧两种命名。"""
     head = path.stem.split(SEP, 1)[0]
-    try:
-        return datetime.strptime(head, TIME_FMT)
-    except ValueError:
-        return None
+    for fmt in (TIME_FMT, WIN_TIME_FMT, LEGACY_TIME_FMT):
+        try:
+            return datetime.strptime(head, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _scan_errors(path: Path) -> int:
@@ -64,7 +76,9 @@ class DailyRunLog:
                 return self._pending
             self.directory.mkdir(parents=True, exist_ok=True)
             self._started_at = datetime.now()
-            self._pending = self.directory / f"{self._started_at.strftime(TIME_FMT)}.log"
+            self._pending = (
+                self.directory / f"{self._started_at.strftime(_time_format())}.log"
+            )
             handler = logging.FileHandler(self._pending, encoding="utf-8")
             handler.setFormatter(logging.Formatter(LOG_FORMAT))
             logging.getLogger().addHandler(handler)
@@ -84,8 +98,8 @@ class DailyRunLog:
                 self._handler = None
             ended_at = datetime.now()
             target = self.directory / (
-                f"{self._started_at.strftime(TIME_FMT)}{SEP}"
-                f"{ended_at.strftime(TIME_FMT)}.log"
+                f"{self._started_at.strftime(_time_format())}{SEP}"
+                f"{ended_at.strftime(_time_format())}.log"
             )
             try:
                 self._pending.replace(target)
