@@ -71,7 +71,7 @@
     - 天数为 **0** 时退化成「随爬取立即上传」：每次爬取结束就把所有未上传文件推走（和首次运行一样），「下一次上传」显示为「随爬取立即上传」。
   - `age`（旧行为）：每天到上传时间点，只传**已保存满 `upload.min_age_days` 天**的文件。若当天的上传时间点已过，爬取结束后立即上传。
   - 点「立即上传」或首次运行仍然忽略一切期限，但只推送**每个标题族的最新版本**。
-  - 上传按解析窗口执行：每波最多 `upload.max_parsing_documents`（默认 500）个文件，等待该波全部完成后再推下一波。单文档超过 `parse_timeout_minutes` 时先取消解析、继续后续文件，再按 `parse_retry_rounds` 重试。
+  - 上传使用滚动解析窗口：默认最多 `upload.max_parsing_documents`（30）个文件同时处于 `RUNNING/UNSTART/PENDING`。任一文件完成后立即上传并启动下一个；长时间未完成会持续等待，不设超时、不取消。只有服务器返回 `FAIL` 才按间隔定期重试，最多 3 次。
 
 ## 配置说明
 
@@ -109,11 +109,10 @@
 | `upload.interval_days` | `3` | `interval` 策略的周期（天）；`0` = 每次爬取结束立即上传全部未上传的最新版本 |
 | `upload.min_age_days` | `3` | 仅 `age` 策略使用：定时上传前至少保留的天数 |
 | `upload.max_age_days` | `4` | 预留参数，当前不用于限制上传截止 |
-| `upload.max_parsing_documents` | `500` | 单个上传窗口最多同时触发解析的文档数 |
-| `upload.parse_timeout_minutes` | `30` | 单波解析最长等待时间；超时文档取消解析并进入重试队列 |
+| `upload.max_parsing_documents` | `30` | 滚动窗口内最多同时处于解析状态的文件数 |
 | `upload.parse_poll_seconds` | `10` | 解析状态轮询间隔 |
-| `upload.parse_retry_rounds` | `1` | 新文件都上传完后，对失败/超时文档重新触发解析的轮数 |
-| `upload.upload_batch_size` | `5` | 单个 HTTP 上传请求的文件数，不改变解析窗口上限 |
+| `upload.parse_retry_rounds` | `3` | 服务器返回 `FAIL` 后最多重新触发的次数，上限固定为 3 |
+| `upload.parse_retry_interval_minutes` | `10` | `FAIL` 文件的定期重试间隔 |
 | `ragflow.base_url` | — | RAGFlow 地址（`.../api/v1`） |
 | `ragflow.api_key` | — | RAGFlow API Key，建议用环境变量注入 |
 | `ragflow.dataset_name_ccdi` / `dataset_name_bit` | `中纪检` / `校纪检` | 两个知识库名称 |
@@ -159,7 +158,7 @@
 - **保存位置**：直接修改输出目录，点「应用保存位置」生效（需无任务运行）。
 - **爬取方式**：顺序 / 并行切换。
 - **上传方式**：手动 / 自动切换（原来在模式卡片里的「爬取结束后上传」已移到这里，两个模式共用）。
-- **上传进度条**：上传开始后显示，按“已推送到 RAGFlow 的数量”更新；内部 HTTP 请求默认每批 5 个，解析窗口默认 500 个，结束后保留结果提示约 10 秒。
+- **上传进度条**：上传开始后显示，按“已推送到 RAGFlow 的数量”更新；默认最多 30 个文件同时处于解析状态，任一文件完成后立即补传下一个。长时间解析会持续等待，服务器返回 `FAIL` 才按配置间隔重试，最多 3 次。
 
 **任务控制**
 
@@ -239,7 +238,7 @@
 - `maintenance_flags`：中纪检、校纪检各自的日期与索引时效标志；`true` 时直接复用已有数据，新增或变更后置为 `false`，维护完成后恢复为 `true`。
 - `backfill_status`：中纪检、校纪检各自的日期补录状态，以及版本索引建立状态、进度、当前年份/页码和最近更新时间。
 - `backfill_resume.json`：轻量断点文件。中纪检保存当前年份、已核对页、下一页、该年总页数/条数和本年已补数量；校纪检保存目录页进度。中断重启后从下一页继续。
-- `parse_queue`：正在解析的 RAGFlow 文档 ID、失败/超时重试 ID、波次与状态说明。
+- `parse_queue`：正在解析、`FAIL` 待重试以及重试耗尽的 RAGFlow 文档 ID、下一次重试时间和状态说明；长时间解析不会因超时进入该队列。
 - `progress`：`ccdi` / `bit` / `upload` 的状态、进度、当前消息、提示（note）。
 - `last_crawl_time` / `last_upload_time`：各自来源的上次时间。
 - `daily_new_count`：按日期的每日新增数。

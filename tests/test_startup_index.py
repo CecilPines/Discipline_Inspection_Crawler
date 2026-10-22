@@ -166,6 +166,71 @@ class StartupIndexTests(unittest.TestCase):
             ccdi.assert_not_called()
             bit.assert_not_called()
 
+    def test_restart_keeps_active_parses_waiting_instead_of_retrying(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = CrawlerState(root / "crawler_state.json")
+            state.set_parse_queue(
+                {
+                    "active": [
+                        {
+                            "source": "ccdi",
+                            "dataset_id": "dataset-1",
+                            "document_id": "doc-running",
+                            "doc_key": "ccdi:1",
+                        }
+                    ],
+                    "retry": [],
+                    "wave": 7,
+                    "message": "解析中",
+                }
+            )
+            controller = self._controller(root, state)
+
+            controller.recover_stale_progress()
+
+            queue = state.get_parse_queue()
+            self.assertEqual(len(queue["active"]), 1)
+            self.assertEqual(queue["active"][0]["document_id"], "doc-running")
+            self.assertEqual(queue["retry"], [])
+            self.assertIn("继续等待服务器解析", queue["message"])
+
+    def test_restart_auto_resumes_interrupted_upload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = CrawlerState(root / "crawler_state.json")
+            state.set_all_maintenance_flags(True)
+            state.set_parse_queue(
+                {
+                    "active": [
+                        {
+                            "source": "ccdi",
+                            "dataset_id": "dataset-1",
+                            "document_id": "doc-running",
+                            "doc_key": "ccdi:1",
+                        }
+                    ],
+                    "retry": [],
+                    "wave": 3,
+                    "message": "解析中",
+                }
+            )
+            controller = self._controller(root, state)
+
+            with patch.object(
+                controller,
+                "start_upload",
+                return_value={"started": True},
+            ) as start_upload:
+                result = controller.resume_interrupted_upload()
+
+            self.assertTrue(result["started"])
+            start_upload.assert_called_once_with(
+                allow_during_crawl=True, immediate=True
+            )
+            upload_progress = state.snapshot()["progress"]["upload"]
+            self.assertEqual(upload_progress["status"], "running")
+
     def test_first_run_forces_every_ccdi_year_to_be_scanned(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

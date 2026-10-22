@@ -585,6 +585,7 @@ HTML_TEMPLATE = """
       <button id="agent_save_btn" onclick="saveAgentConfig()">保存配置</button>
       <button id="agent_refresh_btn" onclick="refreshAgentStatus()">手动刷新</button>
       <button id="agent_migrate_btn" onclick="openMigrationDialog()" style="background:#b91c1c;color:#fff">迁库</button>
+      <button id="agent_cancel_parsing_btn" onclick="cancelAllParsing()" style="background:#d97706;color:#fff">取消全部解析</button>
     </div>
     <div id="agent_msg" class="hint" style="display:none;color:#16a34a;margin-top:10px"></div>
     <div id="agent_error" class="hint" style="display:none;color:#dc2626;margin-top:10px"></div>
@@ -1418,12 +1419,13 @@ function renderAgentTaskCard(uploadState, parseSettings) {
     + '<div class="bar"><span style="width:' + pct + '%"></span></div>'
     + '<div class="stat-row">'
     + '<span class="pill running">解析中 ' + active.length + '</span>'
-    + '<span class="pill failed">待重试 ' + retry.length + '</span>'
+    + '<span class="pill failed">解析异常 ' + retry.length + '</span>'
     + (queue.wave ? '<span class="pill pending">波次 ' + queue.wave + '</span>' : '')
     + '</div>'
-    + '<div class="muted" style="margin-top:7px">并发上限 '
-    + esc(parseSettings.max_parsing_documents || 500)
-    + ' · 超时 ' + esc(parseSettings.parse_timeout_minutes || 30) + ' 分钟</div>';
+    + '<div class="muted" style="margin-top:7px">同时解析上限 '
+    + esc(parseSettings.max_parsing_documents || 30)
+    + ' 个 · 未完成持续等待 · FAIL 最多重试 '
+    + esc(parseSettings.parse_retry_rounds ?? 3) + ' 次</div>';
   const dateCard = (source, title) => {
     const state = backfillStatus[source] || {};
     const sourceIndex = indexSources[source] || {};
@@ -1563,11 +1565,14 @@ function renderAgentRetryBoxes(uploadState) {
       el.innerHTML = '';
       continue;
     }
+    const pending = items.filter(x => !x.exhausted).length;
+    const exhausted = items.length - pending;
     el.innerHTML = '<details class="retry-box"' + (wasOpen ? ' open' : '') + '>'
-      + '<summary>解析超时/失败待重试 ' + items.length + ' 个</summary>'
+      + '<summary>解析 FAIL ' + items.length + ' 个 · 待重试 ' + pending
+      + (exhausted ? ' · 重试耗尽 ' + exhausted : '') + '</summary>'
       + '<div class="task-id-list">'
-      + items.map(x => '<span class="tag tag-failed" title="'
-          + esc(x.file_name || x.reason || '') + '">'
+      + items.map(x => '<span class="tag ' + (x.exhausted ? 'tag-no' : 'tag-failed')
+          + '" title="' + esc(x.file_name || x.reason || '') + '">'
           + esc(x.document_id || '') + '</span>').join('')
       + '</div></details>';
   }
@@ -1647,6 +1652,35 @@ async function confirmMigration() {
   } finally {
     btn.disabled = false;
     btn.textContent = '再次确认并迁库';
+  }
+}
+
+async function cancelAllParsing() {
+  const btn = document.getElementById('agent_cancel_parsing_btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '正在取消…';
+  }
+  try {
+    const r = await api('/api/cancel_parsing', { method: 'POST' });
+    if (!r.ok) {
+      setCtlStatus('取消解析失败：' + (r.data.error || r.status), true);
+      return;
+    }
+    const count = Number(r.data.cancelled || 0);
+    const errors = (r.data.errors || []).join('；');
+    setCtlStatus(
+      errors
+        ? '已取消 ' + count + ' 个解析；部分失败：' + errors
+        : '已取消全部解析：' + count + ' 个文件，后续上传已暂停',
+      !!errors
+    );
+    await refreshAgentStatus();
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '取消全部解析';
+    }
   }
 }
 
@@ -2399,6 +2433,13 @@ def create_monitor_app(controller) -> Flask:
     def api_migrate():
         try:
             return jsonify(controller.start_dataset_migration())
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
+
+    @app.post("/api/cancel_parsing")
+    def api_cancel_parsing():
+        try:
+            return jsonify(controller.cancel_all_parsing())
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 409
 

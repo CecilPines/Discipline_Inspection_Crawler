@@ -515,6 +515,7 @@ class JobController:
         self._crawl_running = False
         self._upload_running = False
         self._migration_running = False
+        self._upload_was_interrupted = False
         self._last_crawl_results = {"ccdi": 0, "bit": 0}
         self._index_building = False
         index_meta = state.get_version_index_status()
@@ -605,21 +606,36 @@ class JobController:
             "parse_settings": {
                 "max_parsing_documents": int(
                     ((self.config.get("upload", {}) or {}).get(
-                        "max_parsing_documents", 500
-                    ))
-                    or 500
-                ),
-                "parse_timeout_minutes": float(
-                    ((self.config.get("upload", {}) or {}).get(
-                        "parse_timeout_minutes", 30
+                        "max_parsing_documents", 30
                     ))
                     or 30
                 ),
+                "parse_batch_size": int(
+                    ((self.config.get("upload", {}) or {}).get(
+                        "max_parsing_documents", 30
+                    ))
+                    or 30
+                ),
+                "parse_poll_seconds": float(
+                    ((self.config.get("upload", {}) or {}).get(
+                        "parse_poll_seconds", 10
+                    ))
+                    or 10
+                ),
                 "parse_retry_rounds": int(
                     ((self.config.get("upload", {}) or {}).get(
-                        "parse_retry_rounds", 1
+                        "parse_retry_rounds", 3
                     ))
-                    or 0
+                    if ((self.config.get("upload", {}) or {}).get(
+                        "parse_retry_rounds", 3
+                    )) is not None
+                    else 3
+                ),
+                "parse_retry_interval_minutes": float(
+                    ((self.config.get("upload", {}) or {}).get(
+                        "parse_retry_interval_minutes", 10
+                    ))
+                    or 10
                 ),
             },
             "paused": self._pause_event.is_set(),
@@ -773,10 +789,13 @@ class JobController:
             "upload.strategy": up.get("strategy", "interval"),
             "upload.interval_days": up.get("interval_days", 3),
             "upload.min_age_days": up.get("min_age_days", 3),
-            "upload.max_parsing_documents": up.get("max_parsing_documents", 500),
-            "upload.parse_timeout_minutes": up.get("parse_timeout_minutes", 30),
+            "upload.parse_batch_size": up.get("max_parsing_documents", 30),
+            "upload.max_parsing_documents": up.get("max_parsing_documents", 30),
             "upload.parse_poll_seconds": up.get("parse_poll_seconds", 10),
-            "upload.parse_retry_rounds": up.get("parse_retry_rounds", 1),
+            "upload.parse_retry_rounds": up.get("parse_retry_rounds", 3),
+            "upload.parse_retry_interval_minutes": up.get(
+                "parse_retry_interval_minutes", 10
+            ),
             "ragflow.base_url": rag.get("base_url", ""),
             "ragflow.chunk_method": rag.get("chunk_method", "laws"),
             "ragflow.dataset_name_ccdi": rag.get("dataset_name_ccdi", "中纪检"),
@@ -976,10 +995,18 @@ class JobController:
         for source, label in (("ccdi", "中纪检"), ("bit", "校纪检"), ("upload", "上传")):
             prog = (snap.get("progress", {}) or {}).get(source) or {}
             if prog.get("status") == "running":
+                if source == "upload":
+                    self._upload_was_interrupted = True
                 self.state.set_progress(
                     source,
                     status="idle",
-                    message=f"{label}上次运行被中断（进程已退出），可点「开始」继续",
+                    message=(
+                        f"{label}上次运行被中断（进程已退出），"
+                        "正在等待自动恢复"
+                        if source == "upload"
+                        else f"{label}上次运行被中断（进程已退出），"
+                        "可点「开始」继续"
+                    ),
                 )
                 names.append(label)
         cats = self.state.get_category_status("ccdi")
@@ -1011,20 +1038,18 @@ class JobController:
         active = [dict(row) for row in queue.get("active", [])]
         if active:
             retry = [dict(row) for row in queue.get("retry", [])]
-            seen = {
-                (row.get("dataset_id"), row.get("document_id")) for row in retry
-            }
             for row in active:
-                key = (row.get("dataset_id"), row.get("document_id"))
-                if key not in seen:
-                    row["reason"] = "程序重启前的解析未完成"
-                    retry.append(row)
+                row["reason"] = "程序重启后继续等待服务器解析"
             self.state.set_parse_queue(
                 {
-                    "active": [],
+                    "active": active,
                     "retry": retry,
                     "wave": int(queue.get("wave") or 0),
-                    "message": f"已恢复 {len(active)} 个中断的解析文件，等待重试",
+                    "message": (
+                        f"已保留 {len(active)} 个解析中文件；"
+                        "点击“立即上传”后继续等待服务器解析，"
+                        "不会取消或按超时重试"
+                    ),
                 }
             )
 
@@ -2603,6 +2628,52 @@ class JobController:
         threading.Thread(target=worker, daemon=True, name="ui-upload").start()
         return {"started": True}
 
+    def has_interrupted_upload(self) -> bool:
+        """是否存在重启前未完成、需要自动续跑的上传/解析任务。"""
+        if self._upload_was_interrupted:
+            return True
+        snap = self.state.snapshot()
+        queue = snap.get("parse_queue") or {}
+        if queue.get("active") or any(
+            not row.get("exhausted")
+            for row in (queue.get("retry") or [])
+            if isinstance(row, dict)
+        ):
+            return True
+        migration = snap.get("dataset_migration") or {}
+        if migration.get("status") == "uploading":
+            return True
+        for meta in (snap.get("documents") or {}).values():
+            if not isinstance(meta, dict) or not meta.get("uploaded_at"):
+                continue
+            if meta.get("ragflow_document_id") and str(
+                meta.get("parse_status") or "UNSTART"
+            ).upper() in {"RUNNING", "UNSTART", "PENDING"}:
+                return True
+        return False
+
+    def resume_interrupted_upload(self) -> dict:
+        """启动后自动续传；不要求用户再次点击开始/立即上传。"""
+        if not self.has_interrupted_upload():
+            return {"started": False, "reason": "没有未完成的上传任务"}
+        if self._upload_running or self._migration_running or self._index_building:
+            return {"started": False, "reason": "已有任务运行中"}
+        if self._crawl_running:
+            return {
+                "started": False,
+                "reason": "爬取正在运行，等待其后续处理",
+            }
+        if not self._version_index_is_ready():
+            return {"started": False, "reason": "版本索引尚未就绪"}
+        self.state.set_progress(
+            "upload",
+            status="running",
+            message="检测到上次上传/解析未完成，正在自动恢复",
+        )
+        result = self.start_upload(allow_during_crawl=True, immediate=True)
+        logger.info("已自动恢复上次未完成的上传与解析任务")
+        return result
+
     def stop_all(self) -> dict:
         """终止所有任务（爬取 / 上传，含自动上传），并取消待执行的中纪检跳过分类重试。"""
         self.cancel_skipped_retry(reason="已终止所有任务")
@@ -2824,6 +2895,109 @@ class JobController:
     def agent_status(self) -> dict:
         """查询学科智能体连接状态与两个知识库的文档状态统计。"""
         return get_agent_status(self.config, self.state)
+
+    def cancel_all_parsing(self) -> dict:
+        """一键取消中纪检、校纪检两个知识库中正在解析的文档。"""
+        rag_cfg = self.config.get("ragflow", {}) or {}
+        base_url = str(rag_cfg.get("base_url") or "")
+        api_key = str(rag_cfg.get("api_key") or "")
+        if not base_url or not api_key:
+            raise RuntimeError("未配置学科智能体地址或 API Key")
+        # 先停止上传批次循环，避免取消过程中又启动下一批。
+        self._stop_event.set()
+        uploader = RagflowKbUploader(base_url, api_key)
+        datasets = uploader.list_datasets()
+        by_id = {
+            str(item.get("id")): item
+            for item in datasets
+            if isinstance(item, dict) and item.get("id")
+        }
+        target_ids: list[str] = []
+        for label, name_key, id_key in (
+            ("中纪检", "dataset_name_ccdi", "dataset_id_ccdi"),
+            ("校纪检", "dataset_name_bit", "dataset_id_bit"),
+        ):
+            name = str(rag_cfg.get(name_key) or label)
+            configured = str(rag_cfg.get(id_key) or "")
+            matched = [
+                str(item["id"])
+                for item in datasets
+                if isinstance(item, dict)
+                and item.get("id")
+                and item.get("name") == name
+            ]
+            if configured:
+                current = by_id.get(configured)
+                if current is not None and current.get("name") != name:
+                    raise RuntimeError(
+                        f"{label}配置的库 ID 对应“{current.get('name')}”，"
+                        "为避免误取消，已停止操作"
+                    )
+                if current is not None:
+                    target_ids.append(configured)
+            target_ids.extend(matched)
+        target_ids = list(dict.fromkeys(target_ids))
+        if not target_ids:
+            raise RuntimeError("没有找到中纪检或校纪检知识库")
+
+        result = uploader.cancel_active_parsing(target_ids)
+        cancelled_by_dataset = {
+            dataset_id: set(
+                str(value)
+                for value in (info.get("document_ids") or [])
+                if value
+            )
+            for dataset_id, info in (result.get("datasets") or {}).items()
+        }
+        cancelled_ids = set().union(*cancelled_by_dataset.values())
+        updates: dict[str, dict[str, str]] = {}
+        for doc_key, meta in (self.state.snapshot().get("documents") or {}).items():
+            if not isinstance(meta, dict):
+                continue
+            dataset_id = str(meta.get("upload_dataset_id") or "")
+            document_id = str(meta.get("ragflow_document_id") or "")
+            if (
+                dataset_id in cancelled_by_dataset
+                and document_id in cancelled_by_dataset[dataset_id]
+            ):
+                updates[str(doc_key)] = {
+                    "status": "CANCEL",
+                    "ragflow_document_id": document_id,
+                    "error": "用户一键取消解析",
+                }
+        if updates:
+            self.state.set_document_parse_states(updates)
+        queue = self.state.get_parse_queue()
+        active = [
+            dict(row)
+            for row in (queue.get("active") or [])
+            if str(row.get("document_id") or "") not in cancelled_ids
+        ]
+        self.state.set_parse_queue(
+            {
+                "active": active,
+                "retry": [
+                    dict(row) for row in (queue.get("retry") or [])
+                ],
+                "wave": int(queue.get("wave") or 0),
+                "message": (
+                    f"已取消 {result.get('cancelled', 0)} 个解析任务"
+                    + (
+                        f"；部分知识库失败：{'；'.join(result.get('errors') or [])}"
+                        if result.get("errors")
+                        else ""
+                    )
+                ),
+            }
+        )
+        self.state.set_progress(
+            "upload",
+            message=(
+                f"已一键取消全部解析：{result.get('cancelled', 0)} 个文件；"
+                "后续上传已暂停"
+            ),
+        )
+        return result
 
     def _persist_dataset_ids(self, ccdi_id: str, bit_id: str) -> None:
         rag = self.config.setdefault("ragflow", {})
@@ -3131,6 +3305,9 @@ def main() -> None:
             logger.error("启动索引准备未完成：%s", index_result.get("message"))
 
     ran_work = False
+    resume_upload_after_startup = (
+        not args.no_auto_start and controller.has_interrupted_upload()
+    )
     try:
         if not index_ready and not defer_maintenance:
             logger.error("版本索引未就绪，本次启动跳过自动爬取与上传")
@@ -3143,9 +3320,25 @@ def main() -> None:
             if args.crawl_now:
                 controller.crawl_now_sync(source=args.source)
                 ran_work = True
-            if args.upload_now:
+        if (
+            resume_upload_after_startup
+            and not controller._upload_running
+            and not controller._migration_running
+        ):
+            if args.no_schedule and args.no_ui:
                 controller.upload_now_sync()
                 ran_work = True
+            else:
+                resumed = controller.resume_interrupted_upload()
+                if resumed.get("started"):
+                    ran_work = True
+                else:
+                    logger.warning(
+                        "未自动恢复上传：%s", resumed.get("reason") or "未知原因"
+                    )
+        if args.upload_now and not controller._upload_running:
+            controller.upload_now_sync()
+            ran_work = True
     except KeyboardInterrupt:
         # systemd stop / 关机发的 SIGTERM 也走这里：停止位已置上，直接退出
         logger.info("收到停止信号，已中断当前任务，进程退出")

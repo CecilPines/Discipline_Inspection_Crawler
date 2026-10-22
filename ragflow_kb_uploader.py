@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -422,6 +422,41 @@ class RagflowKbUploader:
         )
         self._check(resp, "取消文档解析")
 
+    def cancel_active_parsing(
+        self, dataset_ids: list[str] | tuple[str, ...]
+    ) -> dict[str, Any]:
+        """取消多个知识库中当前处于解析队列的文档。"""
+        result: dict[str, Any] = {
+            "cancelled": 0,
+            "datasets": {},
+            "errors": [],
+        }
+        for dataset_id in dict.fromkeys(
+            str(value) for value in dataset_ids if value
+        ):
+            try:
+                documents = self.list_document_objects(dataset_id)
+                active_ids = [
+                    str(doc.get("id"))
+                    for doc in documents
+                    if doc.get("id")
+                    and str(doc.get("run") or "").upper()
+                    in {"RUNNING", "UNSTART", "PENDING"}
+                ]
+                cancelled = 0
+                for start in range(0, len(active_ids), 100):
+                    batch = active_ids[start : start + 100]
+                    self.stop_parsing(dataset_id, batch)
+                    cancelled += len(batch)
+                result["datasets"][dataset_id] = {
+                    "document_ids": active_ids,
+                    "cancelled": cancelled,
+                }
+                result["cancelled"] += cancelled
+            except Exception as exc:
+                result["errors"].append(f"{dataset_id}: {exc}")
+        return result
+
     def delete_documents(self, dataset_id: str, document_ids: list[str]) -> None:
         ids = [str(value) for value in document_ids if value]
         if not ids:
@@ -473,28 +508,34 @@ class RagflowKbUploader:
 def _parse_options(config: dict[str, Any]) -> tuple[int, int, int, int, int]:
     up_cfg = config.get("upload", {}) or {}
     try:
-        max_parsing = max(1, int(up_cfg.get("max_parsing_documents", 500)))
-    except (TypeError, ValueError):
-        max_parsing = 500
-    try:
-        timeout_seconds = max(
-            30, int(float(up_cfg.get("parse_timeout_minutes", 30)) * 60)
+        max_parsing = max(
+            1,
+            int(up_cfg.get("max_parsing_documents", 30)),
         )
     except (TypeError, ValueError):
-        timeout_seconds = 30 * 60
+        max_parsing = 30
     try:
         poll_seconds = max(1, int(up_cfg.get("parse_poll_seconds", 10)))
     except (TypeError, ValueError):
         poll_seconds = 10
     try:
-        retry_rounds = max(0, int(up_cfg.get("parse_retry_rounds", 1)))
+        retry_rounds = min(
+            3, max(0, int(up_cfg.get("parse_retry_rounds", 3)))
+        )
     except (TypeError, ValueError):
-        retry_rounds = 1
+        retry_rounds = 3
     try:
-        upload_batch = max(1, min(50, int(up_cfg.get("upload_batch_size", 5))))
+        retry_interval_seconds = max(
+            0,
+            int(
+                float(up_cfg.get("parse_retry_interval_minutes", 10)) * 60
+            ),
+        )
     except (TypeError, ValueError):
-        upload_batch = 5
-    return max_parsing, timeout_seconds, poll_seconds, retry_rounds, upload_batch
+        retry_interval_seconds = 10 * 60
+    # 第三项以后依次为：轮询间隔、FAIL 最大重试次数、
+    # FAIL 重试间隔、兼容旧配置的上传批大小。
+    return max_parsing, poll_seconds, retry_rounds, retry_interval_seconds, 1
 
 
 def _queue_payload(
@@ -532,8 +573,9 @@ def _wait_for_parse_capacity(
     stop_event: threading.Event | None,
     pause_event: threading.Event | None,
 ) -> int:
-    """返回当前还能安全上传的解析槽位；必要时等待或取消卡住的旧任务。"""
-    started = time.monotonic()
+    """返回当前还能安全上传的解析槽位；有解析任务时一直等待。"""
+    # 新流程不设解析超时：只要已有解析任务未结束，就持续等待。
+    # 用户可通过 UI 的“取消全部解析”主动终止。
     while not (stop_event and stop_event.is_set()):
         wait_while_paused(pause_event, stop_event)
         docs = uploader.list_document_objects(dataset_id)
@@ -545,20 +587,10 @@ def _wait_for_parse_capacity(
         capacity = max(0, max_parsing - len(active))
         if capacity > 0:
             return capacity
-        if time.monotonic() - started >= timeout_seconds:
-            # 旧进程遗留的解析没有本地开始时间。为避免永久占满 500 个槽位，
-            # 超时后取消当前批次，让新一轮上传继续推进。
-            ids = [str(doc.get("id")) for doc in active if doc.get("id")]
-            logger.warning(
-                "知识库已有 %s 个文档处于解析中，等待超过 %s 分钟；取消这些解析以释放槽位",
-                len(ids),
-                timeout_seconds // 60,
-            )
-            try:
-                uploader.stop_parsing(dataset_id, ids)
-            except Exception:
-                logger.exception("取消知识库中卡住的解析失败")
-            return max_parsing
+        logger.info(
+            "知识库已有 %s 个文档正在解析，等待本批解析完成后再上传",
+            len(active),
+        )
         time.sleep(poll_seconds)
     return 0
 
@@ -600,11 +632,10 @@ def _wait_parse_completion(
     pause_event: threading.Event | None,
     wave: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """等待一波文档解析结束；超时文档取消解析并返回重试队列。"""
+    """等待一批文档解析结束；不自动取消、不自动重试。"""
     done: list[dict[str, Any]] = []
     retry: list[dict[str, Any]] = []
     waiting = {str(entry["document_id"]): dict(entry) for entry in entries}
-    started = time.monotonic()
     while waiting:
         if stop_event and stop_event.is_set():
             retry.extend(waiting.values())
@@ -630,7 +661,7 @@ def _wait_parse_completion(
                 entry["reason"] = f"解析状态 {run}"
                 entry["attempts"] = int(entry.get("attempts", 0)) + 1
                 state_updates[entry["doc_key"]] = {
-                    "status": "RETRY",
+                    "status": run,
                     "ragflow_document_id": doc_id,
                     "error": entry["reason"],
                 }
@@ -646,12 +677,12 @@ def _wait_parse_completion(
             wave=wave,
             message=(
                 f"第 {wave} 波解析：{len(done)} 完成 / {len(waiting)} 进行中 / "
-                f"{len(retry)} 待重试"
+                f"{len(retry)} 异常"
             ),
         )
         if not waiting:
             break
-        if time.monotonic() - started >= timeout_seconds:
+        if False:
             timed_out = list(waiting.values())
             ids = [str(item["document_id"]) for item in timed_out]
             state.set_progress(
@@ -791,7 +822,7 @@ def _process_parse_retry(
     return remaining
 
 
-def upload_pending_for_source(
+def _upload_pending_for_source_legacy(
     source: str,
     state: CrawlerState,
     uploader: RagflowKbUploader,
@@ -802,10 +833,10 @@ def upload_pending_for_source(
     immediate: bool = False,
     stop_event: threading.Event | None = None,
     pause_event: threading.Event | None = None,
-    max_parsing_documents: int = 500,
-    parse_timeout_seconds: int = 30 * 60,
+    max_parsing_documents: int = 30,
+    parse_timeout_seconds: int = 0,
     parse_poll_seconds: int = 10,
-    parse_retry_rounds: int = 1,
+    parse_retry_rounds: int = 3,
     upload_batch_size: int = 5,
 ) -> int:
     """上传最新版本，并按波次限制同时解析的文档数量。"""
@@ -856,8 +887,8 @@ def upload_pending_for_source(
         current=0,
         total=total,
         message=(
-            f"上传 {source}: 0/{total} · 解析上限 {max_parsing_documents}"
-            + (f" · 待重试 {len(retry_entries)}" if retry_entries else "")
+            f"上传 {source}: 0/{total} · 解析批次 {max_parsing_documents}"
+            + (f" · 历史异常 {len(retry_entries)}" if retry_entries else "")
         ),
     )
 
@@ -948,44 +979,16 @@ def upload_pending_for_source(
                 uploaded += 1
             if upload_updates:
                 state.mark_uploaded_many(upload_updates)
-            if batch_parse_entries:
-                batch_ids = [
-                    str(entry["document_id"]) for entry in batch_parse_entries
-                ]
-                try:
-                    uploader.start_parsing(dataset_id, batch_ids)
-                except Exception as exc:
-                    logger.exception(
-                        "上传批次触发解析失败，%s 个文件将进入重试",
-                        len(batch_ids),
-                    )
-                    for entry in batch_parse_entries:
-                        entry["attempts"] = int(entry.get("attempts") or 0) + 1
-                        entry["reason"] = f"首次触发解析失败：{exc}"
-                        entry["source"] = source
-                    retry_for_later.extend(batch_parse_entries)
-                else:
-                    parse_entries.extend(batch_parse_entries)
-                    _merge_queue_for_source(
-                        state,
-                        source,
-                        active=parse_entries,
-                        retry=retry_for_later,
-                        wave=wave,
-                        message=(
-                            f"第 {wave} 波已上传 {uploaded} 个，"
-                            f"解析已启动 {len(parse_entries)} 个"
-                        ),
-                    )
+            parse_entries.extend(batch_parse_entries)
             state.set_progress(
                 "upload",
                 current=uploaded,
                 total=total,
                 message=(
                     f"上传 {source}: {uploaded}/{total} · 第 {wave} 波"
-                    f"解析已启动 {len(parse_entries)} 个"
+                    f"已上传 {len(parse_entries)} 个，等待本批上传完成"
                     + (
-                        f" · 待重试 {len(retry_for_later)} 个"
+                        f" · 异常 {len(retry_for_later)} 个"
                         if retry_for_later
                         else ""
                     )
@@ -993,13 +996,45 @@ def upload_pending_for_source(
             )
         if not parse_entries:
             continue
+        ids = [str(entry["document_id"]) for entry in parse_entries]
+        try:
+            uploader.start_parsing(dataset_id, ids)
+        except Exception as exc:
+            logger.exception("第 %s 批触发解析失败，停止上传后续批次", wave)
+            for entry in parse_entries:
+                entry["attempts"] = int(entry.get("attempts") or 0) + 1
+                entry["reason"] = f"触发解析失败：{exc}"
+                entry["source"] = source
+            state.set_document_parse_states(
+                {
+                    entry["doc_key"]: {
+                        "status": "FAIL",
+                        "ragflow_document_id": str(entry["document_id"]),
+                        "error": entry["reason"],
+                    }
+                    for entry in parse_entries
+                }
+            )
+            retry_for_later.extend(parse_entries)
+            _merge_queue_for_source(
+                state,
+                source,
+                active=[],
+                retry=retry_for_later,
+                wave=wave,
+                message=f"第 {wave} 批触发解析失败，已停止后续上传",
+            )
+            break
         _merge_queue_for_source(
             state,
             source,
             active=parse_entries,
             retry=retry_for_later,
             wave=wave,
-            message=f"第 {wave} 波上传完成，等待 {len(parse_entries)} 个文件解析",
+            message=(
+                f"第 {wave} 批上传完成并开始解析："
+                f"{len(parse_entries)} 个文件"
+            ),
         )
         done, failed = _wait_parse_completion(
             uploader,
@@ -1027,8 +1062,8 @@ def upload_pending_for_source(
             retry=retry_for_later,
             wave=wave,
             message=(
-                f"第 {wave} 波结束：解析完成 {len(done)}，"
-                f"待重试 {len(retry_for_later)}"
+                f"第 {wave} 批结束：解析完成 {len(done)}，"
+                f"异常 {len(retry_for_later)}"
             ),
         )
         state.set_progress(
@@ -1036,24 +1071,9 @@ def upload_pending_for_source(
             current=uploaded,
             total=total,
             message=(
-                f"上传 {source}: {uploaded}/{total} · 本波解析完成 {len(done)}"
-                + (f" · 待重试 {len(retry_for_later)}" if retry_for_later else "")
+                f"上传 {source}: {uploaded}/{total} · 本批解析完成 {len(done)}"
+                + (f" · 异常 {len(retry_for_later)}" if retry_for_later else "")
             ),
-        )
-
-    if not (stop_event and stop_event.is_set()) and parse_retry_rounds > 0:
-        retry_for_later = _process_parse_retry(
-            uploader,
-            state,
-            dataset_id,
-            source,
-            _dedupe_queue(retry_entries + retry_for_later),
-            max_parsing=max_parsing_documents,
-            timeout_seconds=parse_timeout_seconds,
-            poll_seconds=parse_poll_seconds,
-            rounds=parse_retry_rounds,
-            stop_event=stop_event,
-            pause_event=pause_event,
         )
 
     stopped = bool(stop_event and stop_event.is_set())
@@ -1064,11 +1084,11 @@ def upload_pending_for_source(
         retry=retry_for_later,
         wave=wave,
         message=(
-            f"{source} 上传已终止，解析重试仍有 {len(retry_for_later)} 个"
+            f"{source} 上传已终止，解析异常 {len(retry_for_later)} 个"
             if stopped
             else (
                 f"{source} 上传完成：本次上传 {uploaded} 个，解析完成 {parsed} 个"
-                + (f"，待重试 {len(retry_for_later)} 个" if retry_for_later else "")
+                + (f"，异常 {len(retry_for_later)} 个" if retry_for_later else "")
             )
         ),
     )
@@ -1082,8 +1102,481 @@ def upload_pending_for_source(
             if stopped
             else (
                 f"{source} 上传完成: {uploaded}"
-                + (f"（解析待重试 {len(retry_for_later)}）" if retry_for_later else "")
+                + (f"（解析异常 {len(retry_for_later)}）" if retry_for_later else "")
             )
+        ),
+    )
+    if uploaded:
+        state.set_last_upload(source)
+    return uploaded
+
+
+def upload_pending_for_source(
+    source: str,
+    state: CrawlerState,
+    uploader: RagflowKbUploader,
+    dataset_id: str,
+    *,
+    min_age_days: int,
+    max_age_days: int,
+    immediate: bool = False,
+    stop_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+    max_parsing_documents: int = 30,
+    parse_timeout_seconds: int = 0,
+    parse_poll_seconds: int = 10,
+    parse_retry_rounds: int = 3,
+    parse_retry_interval_seconds: int | None = None,
+    upload_batch_size: int = 1,
+) -> int:
+    """滚动上传最新版本，始终把服务器解析中的文件控制在配置上限内。
+
+    - RUNNING/UNSTART/PENDING：一直等待，不取消、不按超时重试；
+    - FAIL：等待配置间隔后重新触发解析，最多重试 3 次；
+    - 任一文件完成解析后立即补传下一个文件。
+    """
+    del parse_timeout_seconds, upload_batch_size
+    max_parsing = max(1, int(max_parsing_documents))
+    poll_seconds = max(1, int(parse_poll_seconds))
+    max_retries = min(3, max(0, int(parse_retry_rounds)))
+    retry_interval = (
+        max(0, int(parse_retry_interval_seconds))
+        if parse_retry_interval_seconds is not None
+        else 10 * 60
+    )
+    active_statuses = {"RUNNING", "UNSTART", "PENDING"}
+
+    def entry_for(
+        doc_key: str,
+        document_id: str,
+        reason: str = "",
+        attempts: int = 0,
+    ) -> dict[str, Any]:
+        meta = state.snapshot().get("documents", {}).get(doc_key) or {}
+        return {
+            "source": source,
+            "dataset_id": dataset_id,
+            "document_id": str(document_id),
+            "doc_key": str(doc_key),
+            "file_name": Path(str(meta.get("pdf_path") or "")).name,
+            "started_at": str(meta.get("uploaded_at") or ""),
+            "attempts": max(0, int(attempts)),
+            "reason": reason,
+        }
+
+    keys = state.pending_upload_keys(
+        source, min_age_days, max_age_days, immediate=immediate
+    )
+    current_queue = state.get_parse_queue()
+    retry_by_id: dict[str, dict[str, Any]] = {}
+    for raw in current_queue.get("retry", []):
+        if (
+            not isinstance(raw, dict)
+            or raw.get("source") != source
+            or raw.get("dataset_id") != dataset_id
+            or not raw.get("document_id")
+        ):
+            continue
+        entry = dict(raw)
+        doc_id = str(entry["document_id"])
+        entry["source"] = source
+        entry["dataset_id"] = dataset_id
+        entry["attempts"] = max(0, int(entry.get("attempts") or 0))
+        if entry["attempts"] >= max_retries:
+            entry["exhausted"] = True
+            entry.pop("next_retry_at", None)
+        retry_by_id[doc_id] = entry
+
+    active: dict[str, dict[str, Any]] = {}
+    for doc_key, meta in (state.snapshot().get("documents") or {}).items():
+        if (
+            not isinstance(meta, dict)
+            or meta.get("source") != source
+            or meta.get("upload_dataset_id") != dataset_id
+            or not meta.get("uploaded_at")
+            or not meta.get("ragflow_document_id")
+        ):
+            continue
+        doc_id = str(meta["ragflow_document_id"])
+        parse_status = str(meta.get("parse_status") or "UNSTART").upper()
+        if parse_status == "DONE":
+            continue
+        if parse_status in {"FAIL", "FAILED", "RETRY"}:
+            retry_by_id.setdefault(
+                doc_id,
+                entry_for(
+                    str(doc_key),
+                    doc_id,
+                    reason=str(meta.get("parse_error") or "等待解析重试"),
+                ),
+            )
+        elif parse_status not in {"CANCEL", "CANCELLED"}:
+            active[doc_id] = entry_for(
+                str(doc_key),
+                doc_id,
+                reason="等待已有解析完成",
+            )
+
+    def retry_due(entry: dict[str, Any]) -> bool:
+        if entry.get("exhausted"):
+            return False
+        raw = str(entry.get("next_retry_at") or "")
+        if not raw:
+            return True
+        try:
+            return datetime.fromisoformat(raw) <= datetime.now()
+        except ValueError:
+            return True
+
+    def pending_retry_count() -> int:
+        return sum(
+            1 for entry in retry_by_id.values() if not entry.get("exhausted")
+        )
+
+    def queue_state(message: str, wave: int) -> None:
+        _merge_queue_for_source(
+            state,
+            source,
+            active=list(active.values()),
+            retry=list(retry_by_id.values()),
+            wave=wave,
+            message=message,
+        )
+
+    total = len(keys)
+    uploaded = 0
+    parsed = 0
+    upload_index = 0
+    wave = int(current_queue.get("wave") or 0)
+    state.set_progress(
+        "upload",
+        status="running",
+        current=0,
+        total=total,
+        message=(
+            f"上传 {source}: 0/{total} · 滚动解析上限 {max_parsing}"
+            + (f" · 等待重试 {len(retry_by_id)}" if retry_by_id else "")
+        ),
+    )
+    queue_state(
+        f"上传 {source}: 正在建立解析滚动窗口（上限 {max_parsing}）",
+        wave,
+    )
+
+    while not (stop_event and stop_event.is_set()):
+        try:
+            server_documents = uploader.list_document_objects(dataset_id)
+        except Exception:
+            queue_state(f"上传 {source}: 查询解析状态失败，稍后继续", wave)
+            if stop_event is not None:
+                if stop_event.wait(poll_seconds):
+                    break
+            else:
+                time.sleep(poll_seconds)
+            continue
+        status_by_id = {
+            str(doc.get("id")): str(doc.get("run") or "UNSTART").upper()
+            for doc in server_documents
+            if isinstance(doc, dict) and doc.get("id")
+        }
+        state_updates: dict[str, dict[str, Any]] = {}
+        parsed_entries: list[dict[str, Any]] = []
+        for doc_id, entry in list(active.items()):
+            run = status_by_id.get(doc_id, "UNSTART")
+            entry["run"] = run
+            if run == "DONE":
+                state_updates[entry["doc_key"]] = {
+                    "status": "DONE",
+                    "ragflow_document_id": doc_id,
+                }
+                parsed_entries.append(entry)
+                parsed += 1
+                active.pop(doc_id, None)
+            elif run == "FAIL":
+                active.pop(doc_id, None)
+                entry["reason"] = "服务器返回解析状态 FAIL"
+                attempts = int(entry.get("attempts") or 0)
+                if attempts < max_retries:
+                    entry["next_retry_at"] = (
+                        datetime.now()
+                        + timedelta(seconds=retry_interval)
+                    ).replace(microsecond=0).isoformat()
+                    retry_by_id[doc_id] = entry
+                    state_updates[entry["doc_key"]] = {
+                        "status": "FAIL",
+                        "ragflow_document_id": doc_id,
+                        "error": entry["reason"],
+                    }
+                else:
+                    entry["reason"] = (
+                        f"服务器返回 FAIL，已重试 {attempts} 次"
+                    )
+                    entry["exhausted"] = True
+                    entry.pop("next_retry_at", None)
+                    retry_by_id[doc_id] = entry
+                    state_updates[entry["doc_key"]] = {
+                        "status": "FAIL",
+                        "ragflow_document_id": doc_id,
+                        "error": entry["reason"],
+                    }
+            elif run in {"CANCEL", "CANCELLED"}:
+                active.pop(doc_id, None)
+                state_updates[entry["doc_key"]] = {
+                    "status": "CANCEL",
+                    "ragflow_document_id": doc_id,
+                    "error": "服务器返回 CANCEL",
+                }
+        for doc_id, entry in list(retry_by_id.items()):
+            run = status_by_id.get(doc_id, "")
+            if run == "DONE":
+                retry_by_id.pop(doc_id, None)
+                state_updates[entry["doc_key"]] = {
+                    "status": "DONE",
+                    "ragflow_document_id": doc_id,
+                }
+                parsed_entries.append(entry)
+                parsed += 1
+            elif run in active_statuses:
+                # RAGFlow 已在解析时不要在本地再触发一次。
+                retry_by_id.pop(doc_id, None)
+                entry["run"] = run
+                entry["reason"] = "服务器仍在解析，继续等待"
+                active[doc_id] = entry
+            elif run in {"CANCEL", "CANCELLED"}:
+                retry_by_id.pop(doc_id, None)
+                state_updates[entry["doc_key"]] = {
+                    "status": "CANCEL",
+                    "ragflow_document_id": doc_id,
+                    "error": "服务器返回 CANCEL",
+                }
+        if state_updates:
+            state.set_document_parse_states(state_updates)
+        if parsed_entries:
+            _cleanup_superseded_documents(
+                uploader,
+                state,
+                dataset_id,
+                [entry["doc_key"] for entry in parsed_entries],
+            )
+
+        server_active_ids = {
+            doc_id
+            for doc_id, run in status_by_id.items()
+            if run in active_statuses
+        }
+        capacity = max_parsing - len(server_active_ids | set(active))
+        while capacity > 0:
+            retry_entry = next(
+                (
+                    entry
+                    for _, entry in sorted(
+                        retry_by_id.items(),
+                        key=lambda item: str(item[1].get("next_retry_at") or ""),
+                    )
+                    if retry_due(entry)
+                ),
+                None,
+            )
+            if retry_entry is not None:
+                doc_id = str(retry_entry["document_id"])
+                retry_by_id.pop(doc_id, None)
+                retry_entry["attempts"] = (
+                    int(retry_entry.get("attempts") or 0) + 1
+                )
+                retry_entry.pop("next_retry_at", None)
+                retry_entry["last_retry_at"] = datetime.now().replace(
+                    microsecond=0
+                ).isoformat()
+                try:
+                    uploader.start_parsing(dataset_id, [doc_id])
+                except Exception as exc:
+                    retry_entry["reason"] = f"重新触发解析失败：{exc}"
+                    if int(retry_entry["attempts"]) < max_retries:
+                        retry_entry["next_retry_at"] = (
+                            datetime.now()
+                            + timedelta(seconds=retry_interval)
+                        ).replace(microsecond=0).isoformat()
+                        retry_by_id[doc_id] = retry_entry
+                    else:
+                        retry_entry["exhausted"] = True
+                        retry_entry.pop("next_retry_at", None)
+                        retry_by_id[doc_id] = retry_entry
+                        state.set_document_parse_states(
+                            {
+                                retry_entry["doc_key"]: {
+                                    "status": "FAIL",
+                                    "ragflow_document_id": doc_id,
+                                    "error": retry_entry["reason"],
+                                }
+                            }
+                        )
+                else:
+                    retry_entry["run"] = "RUNNING"
+                    active[doc_id] = retry_entry
+                    state.set_document_parse_states(
+                        {
+                            retry_entry["doc_key"]: {
+                                "status": "RUNNING",
+                                "ragflow_document_id": doc_id,
+                            }
+                        }
+                    )
+                capacity -= 1
+                wave += 1
+                continue
+
+            if upload_index >= len(keys):
+                break
+            key = keys[upload_index]
+            upload_index += 1
+            meta = state.snapshot().get("documents", {}).get(key) or {}
+            pdf_path = Path(str(meta.get("pdf_path") or ""))
+            if not pdf_path.is_file():
+                continue
+            wave += 1
+            state.set_progress(
+                "upload",
+                current=uploaded,
+                total=total,
+                message=(
+                    f"上传 {source}: {uploaded}/{total} · "
+                    f"解析中 {len(server_active_ids | set(active))}/{max_parsing}"
+                ),
+            )
+            docs = uploader.upload_documents_detailed(
+                dataset_id, [str(pdf_path)]
+            )
+            doc = next(
+                (
+                    item
+                    for item in docs
+                    if isinstance(item, dict) and item.get("id")
+                ),
+                None,
+            )
+            if doc is None:
+                remote = uploader.list_document_objects(dataset_id)
+                doc = next(
+                    (
+                        item
+                        for item in remote
+                        if isinstance(item, dict)
+                        and item.get("name") == pdf_path.name
+                        and item.get("id")
+                    ),
+                    None,
+                )
+            if doc is None or not doc.get("id"):
+                raise RuntimeError(
+                    f"上传 {pdf_path.name} 成功但无法取得 RAGFlow 文档 ID"
+                )
+            doc_id = str(doc["id"])
+            state.mark_uploaded_many(
+                [
+                    {
+                        "doc_key": key,
+                        "dataset_id": dataset_id,
+                        "ragflow_document_id": doc_id,
+                    }
+                ]
+            )
+            uploaded += 1
+            entry = entry_for(key, doc_id, reason="初始解析")
+            try:
+                uploader.start_parsing(dataset_id, [doc_id])
+            except Exception as exc:
+                entry["reason"] = f"首次触发解析失败：{exc}"
+                if max_retries > 0:
+                    entry["next_retry_at"] = (
+                        datetime.now() + timedelta(seconds=retry_interval)
+                    ).replace(microsecond=0).isoformat()
+                else:
+                    entry["exhausted"] = True
+                retry_by_id[doc_id] = entry
+                state.set_document_parse_states(
+                    {
+                        key: {
+                            "status": "RETRY",
+                            "ragflow_document_id": doc_id,
+                            "error": entry["reason"],
+                        }
+                    }
+                )
+                capacity -= 1
+            else:
+                entry["run"] = "RUNNING"
+                active[doc_id] = entry
+                capacity -= 1
+                state.set_document_parse_states(
+                    {
+                        key: {
+                            "status": "RUNNING",
+                            "ragflow_document_id": doc_id,
+                        }
+                    }
+                )
+
+        queue_state(
+            (
+                f"{source}: 已上传 {uploaded}/{total}，解析中 "
+                f"{len(server_active_ids | set(active))}/{max_parsing}，"
+                f"待重试 {pending_retry_count()}"
+            ),
+            wave,
+        )
+        state.set_progress(
+            "upload",
+            current=uploaded,
+            total=total,
+            message=(
+                f"上传 {source}: {uploaded}/{total} · 解析中 "
+                f"{len(server_active_ids | set(active))}/{max_parsing}"
+                + (
+                    f" · 待重试 {pending_retry_count()}"
+                    if pending_retry_count()
+                    else ""
+                )
+            ),
+        )
+
+        if (
+            upload_index >= len(keys)
+            and not active
+            and pending_retry_count() == 0
+        ):
+            break
+        if stop_event is not None:
+            if stop_event.wait(poll_seconds):
+                break
+        else:
+            time.sleep(poll_seconds)
+
+    stopped = bool(stop_event and stop_event.is_set())
+    queue_state(
+        (
+            f"{source} 上传已终止，仍有 {len(active)} 个解析中"
+            if stopped
+            else (
+                f"{source} 上传完成：本次上传 {uploaded} 个，"
+                f"解析完成 {parsed} 个"
+                + (
+                    f"，FAIL 待重试 {pending_retry_count()} 个"
+                    if pending_retry_count()
+                    else ""
+                )
+            )
+        ),
+        wave,
+    )
+    state.set_progress(
+        "upload",
+        status="running" if stopped and active else "idle",
+        current=uploaded,
+        total=total,
+        message=(
+            f"{source} 上传已终止: {uploaded}"
+            if stopped
+            else f"{source} 上传与解析完成: {uploaded}"
         ),
     )
     if uploaded:
@@ -1106,7 +1599,13 @@ def run_scheduled_uploads(
     max_age = int(up_cfg.get("max_age_days", 4))
     chunk_method = rag_cfg.get("chunk_method", "laws")
     chunk_token = int(rag_cfg.get("chunk_token_num", 512))
-    max_parsing, timeout_seconds, poll_seconds, retry_rounds, batch_size = (
+    (
+        max_parsing,
+        poll_seconds,
+        retry_rounds,
+        retry_interval_seconds,
+        batch_size,
+    ) = (
         _parse_options(config)
     )
 
@@ -1136,9 +1635,9 @@ def run_scheduled_uploads(
             stop_event=stop_event,
             pause_event=pause_event,
             max_parsing_documents=max_parsing,
-            parse_timeout_seconds=timeout_seconds,
             parse_poll_seconds=poll_seconds,
             parse_retry_rounds=retry_rounds,
+            parse_retry_interval_seconds=retry_interval_seconds,
             upload_batch_size=batch_size,
         ),
         "bit": upload_pending_for_source(
@@ -1152,9 +1651,9 @@ def run_scheduled_uploads(
             stop_event=stop_event,
             pause_event=pause_event,
             max_parsing_documents=max_parsing,
-            parse_timeout_seconds=timeout_seconds,
             parse_poll_seconds=poll_seconds,
             parse_retry_rounds=retry_rounds,
+            parse_retry_interval_seconds=retry_interval_seconds,
             upload_batch_size=batch_size,
         ),
     }
@@ -1254,7 +1753,13 @@ def migrate_dataset_libraries(
     state.reset_uploads_for_dataset_migration()
 
     up_cfg = config.get("upload", {}) or {}
-    max_parsing, timeout_seconds, poll_seconds, retry_rounds, batch_size = (
+    (
+        max_parsing,
+        poll_seconds,
+        retry_rounds,
+        retry_interval_seconds,
+        batch_size,
+    ) = (
         _parse_options(config)
     )
     counts = {
@@ -1269,9 +1774,9 @@ def migrate_dataset_libraries(
             stop_event=stop_event,
             pause_event=pause_event,
             max_parsing_documents=max_parsing,
-            parse_timeout_seconds=timeout_seconds,
             parse_poll_seconds=poll_seconds,
             parse_retry_rounds=retry_rounds,
+            parse_retry_interval_seconds=retry_interval_seconds,
             upload_batch_size=batch_size,
         ),
         "bit": upload_pending_for_source(
@@ -1285,9 +1790,9 @@ def migrate_dataset_libraries(
             stop_event=stop_event,
             pause_event=pause_event,
             max_parsing_documents=max_parsing,
-            parse_timeout_seconds=timeout_seconds,
             parse_poll_seconds=poll_seconds,
             parse_retry_rounds=retry_rounds,
+            parse_retry_interval_seconds=retry_interval_seconds,
             upload_batch_size=batch_size,
         ),
     }
@@ -1523,10 +2028,19 @@ def get_agent_status(
         }
     up_cfg = config.get("upload", {}) or {}
     result["parse_settings"] = {
-        "max_parsing_documents": int(up_cfg.get("max_parsing_documents", 500) or 500),
-        "parse_timeout_minutes": float(up_cfg.get("parse_timeout_minutes", 30) or 30),
+        "max_parsing_documents": int(
+            up_cfg.get("max_parsing_documents", 30) or 30
+        ),
+        "parse_batch_size": int(
+            up_cfg.get("max_parsing_documents", 30) or 30
+        ),
         "parse_poll_seconds": int(up_cfg.get("parse_poll_seconds", 10) or 10),
-        "parse_retry_rounds": int(up_cfg.get("parse_retry_rounds", 1) or 0),
+        "parse_retry_rounds": min(
+            3, max(0, int(up_cfg.get("parse_retry_rounds", 3) or 0))
+        ),
+        "parse_retry_interval_minutes": float(
+            up_cfg.get("parse_retry_interval_minutes", 10) or 10
+        ),
     }
     if not base_url or not api_key:
         result["error"] = "未配置 RAGFlow 地址或 API Key"

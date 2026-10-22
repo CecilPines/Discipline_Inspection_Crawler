@@ -75,6 +75,70 @@ class NoUploadResponseUploader(FakeUploader):
         ]
 
 
+class FailingUploader(FakeUploader):
+    def start_parsing(self, dataset_id, document_ids):
+        self.started.extend(document_ids)
+        for doc_id in document_ids:
+            self._status[doc_id] = "FAIL"
+
+
+class OrderedUploader(FakeUploader):
+    def __init__(self):
+        super().__init__(complete=True)
+        self.events: list[tuple[str, list[str]]] = []
+
+    def upload_documents_detailed(self, dataset_id, paths):
+        docs = super().upload_documents_detailed(dataset_id, paths)
+        self.events.append(("upload", [doc["id"] for doc in docs]))
+        return docs
+
+    def start_parsing(self, dataset_id, document_ids):
+        self.events.append(("parse", list(document_ids)))
+        super().start_parsing(dataset_id, document_ids)
+
+
+class RollingWindowUploader(FakeUploader):
+    def __init__(self):
+        super().__init__(complete=False)
+        self.uploaded_ids: list[str] = []
+        self.poll_count = 0
+
+    def upload_documents_detailed(self, dataset_id, paths):
+        docs = super().upload_documents_detailed(dataset_id, paths)
+        self.uploaded_ids.extend(doc["id"] for doc in docs)
+        return docs
+
+    def list_document_objects(self, dataset_id):
+        self.poll_count += 1
+        running = [
+            doc_id for doc_id, status in self._status.items()
+            if status == "RUNNING"
+        ]
+        if running:
+            self._status[running[0]] = "DONE"
+        return [
+            {"id": doc_id, "run": status, "name": doc_id}
+            for doc_id, status in self._status.items()
+        ]
+
+
+class AlwaysFailUploader(FakeUploader):
+    def start_parsing(self, dataset_id, document_ids):
+        self.started.extend(document_ids)
+        for doc_id in document_ids:
+            self._status[doc_id] = "FAIL"
+
+
+class SlowRunningUploader(FakeUploader):
+    def __init__(self, stop_event):
+        super().__init__(complete=False)
+        self.stop_event = stop_event
+
+    def start_parsing(self, dataset_id, document_ids):
+        super().start_parsing(dataset_id, document_ids)
+        self.stop_event.set()
+
+
 class FakeMigrationUploader(FakeUploader):
     def __init__(self):
         super().__init__(complete=True)
@@ -128,6 +192,22 @@ class DirtyDatasetUploader(RagflowKbUploader):
 
     def delete_documents(self, dataset_id, document_ids):
         self.deleted_documents.extend(document_ids)
+
+
+class ActiveParsingUploader(RagflowKbUploader):
+    def __init__(self):
+        super().__init__("https://ragflow.example", "test-key")
+        self.stopped: dict[str, list[str]] = {}
+
+    def list_document_objects(self, dataset_id):
+        return [
+            {"id": f"{dataset_id}-running", "run": "RUNNING"},
+            {"id": f"{dataset_id}-queued", "run": "UNSTART"},
+            {"id": f"{dataset_id}-done", "run": "DONE"},
+        ]
+
+    def stop_parsing(self, dataset_id, document_ids):
+        self.stopped.setdefault(dataset_id, []).extend(document_ids)
 
 
 class JsonResponse:
@@ -191,9 +271,9 @@ class UploadVersionTests(unittest.TestCase):
             if fake.started[0] == "doc-1" else snap["documents"]["ccdi:2"]["ragflow_document_id"]
         )
 
-    def test_timeout_cancels_and_queues_retry(self):
-        self._write_and_register("ccdi:9", "超时法规", "2023-03-03", "timeout")
-        fake = FakeUploader(complete=False)
+    def test_failed_parse_is_recorded_without_automatic_retry(self):
+        self._write_and_register("ccdi:9", "失败法规", "2023-03-03", "fail")
+        fake = FailingUploader(complete=False)
         upload_pending_for_source(
             "ccdi",
             self.state,
@@ -208,9 +288,129 @@ class UploadVersionTests(unittest.TestCase):
             parse_retry_rounds=0,
         )
         queue = self.state.get_parse_queue()
-        self.assertEqual(len(fake.stopped), 1)
+        self.assertEqual(fake.stopped, [])
         self.assertEqual(len(queue["retry"]), 1)
         self.assertEqual(queue["retry"][0]["doc_key"], "ccdi:9")
+        self.assertEqual(
+            self.state.snapshot()["documents"]["ccdi:9"]["parse_status"],
+            "FAIL",
+        )
+
+    def test_next_upload_batch_waits_until_previous_batch_is_parsed(self):
+        self._write_and_register("ccdi:20", "批次一", "2024-01-01", "batch1")
+        self._write_and_register("ccdi:21", "批次二", "2024-01-02", "batch2")
+        fake = OrderedUploader()
+
+        upload_pending_for_source(
+            "ccdi",
+            self.state,
+            fake,
+            "dataset-new",
+            min_age_days=0,
+            max_age_days=999,
+            immediate=True,
+            max_parsing_documents=1,
+            parse_timeout_seconds=1,
+            parse_poll_seconds=1,
+            parse_retry_rounds=0,
+            upload_batch_size=1,
+        )
+
+        self.assertEqual(
+            fake.events,
+            [
+                ("upload", ["doc-1"]),
+                ("parse", ["doc-1"]),
+                ("upload", ["doc-2"]),
+                ("parse", ["doc-2"]),
+            ],
+        )
+
+    def test_rolling_window_refills_as_each_parse_completes(self):
+        for index in range(3):
+            self._write_and_register(
+                f"ccdi:{30 + index}",
+                f"滚动法规 {index}",
+                "2024-01-01",
+                f"rolling-{index}",
+            )
+        fake = RollingWindowUploader()
+
+        with patch("ragflow_kb_uploader.time.sleep"):
+            uploaded = upload_pending_for_source(
+                "ccdi",
+                self.state,
+                fake,
+                "dataset-new",
+                min_age_days=0,
+                max_age_days=999,
+                immediate=True,
+                max_parsing_documents=2,
+                parse_poll_seconds=1,
+                parse_retry_rounds=3,
+                parse_retry_interval_seconds=0,
+            )
+
+        self.assertEqual(uploaded, 3)
+        self.assertEqual(fake.uploaded_ids, ["doc-1", "doc-2", "doc-3"])
+        self.assertGreaterEqual(fake.poll_count, 4)
+
+    def test_parse_fail_is_retried_three_times_then_exhausted(self):
+        self._write_and_register(
+            "ccdi:40", "持续失败法规", "2024-01-01", "always-fail"
+        )
+        fake = AlwaysFailUploader(complete=False)
+
+        with patch("ragflow_kb_uploader.time.sleep"):
+            upload_pending_for_source(
+                "ccdi",
+                self.state,
+                fake,
+                "dataset-new",
+                min_age_days=0,
+                max_age_days=999,
+                immediate=True,
+                max_parsing_documents=1,
+                parse_poll_seconds=1,
+                parse_retry_rounds=3,
+                parse_retry_interval_seconds=0,
+            )
+
+        self.assertEqual(fake.started, ["doc-1", "doc-1", "doc-1", "doc-1"])
+        queue = self.state.get_parse_queue()
+        self.assertEqual(queue["retry"][0]["attempts"], 3)
+        self.assertTrue(queue["retry"][0]["exhausted"])
+        self.assertEqual(
+            self.state.snapshot()["documents"]["ccdi:40"]["parse_status"],
+            "FAIL",
+        )
+
+    def test_long_running_parse_is_waited_without_cancellation(self):
+        self._write_and_register(
+            "ccdi:41", "慢解析法规", "2024-01-01", "slow-running"
+        )
+        stop_event = threading.Event()
+        fake = SlowRunningUploader(stop_event)
+
+        upload_pending_for_source(
+            "ccdi",
+            self.state,
+            fake,
+            "dataset-new",
+            min_age_days=0,
+            max_age_days=999,
+            immediate=True,
+            stop_event=stop_event,
+            max_parsing_documents=1,
+            parse_poll_seconds=1,
+            parse_retry_rounds=3,
+            parse_retry_interval_seconds=0,
+        )
+
+        self.assertEqual(fake.stopped, [])
+        queue = self.state.get_parse_queue()
+        self.assertEqual(len(queue["active"]), 1)
+        self.assertEqual(queue["active"][0]["run"], "RUNNING")
 
     def test_upload_without_response_ids_falls_back_to_library_listing(self):
         self._write_and_register("ccdi:8", "无响应编号法规", "2024-04-05", "noid")
@@ -295,6 +495,21 @@ class UploadVersionTests(unittest.TestCase):
 
         self.assertEqual(result, [])
         self.assertEqual(request_mock.call_count, 2)
+
+    def test_cancel_active_parsing_handles_both_sources(self):
+        uploader = ActiveParsingUploader()
+
+        result = uploader.cancel_active_parsing(["ccdi-ds", "bit-ds"])
+
+        self.assertEqual(result["cancelled"], 4)
+        self.assertEqual(
+            uploader.stopped["ccdi-ds"],
+            ["ccdi-ds-running", "ccdi-ds-queued"],
+        )
+        self.assertEqual(
+            uploader.stopped["bit-ds"],
+            ["bit-ds-running", "bit-ds-queued"],
+        )
 
 
 if __name__ == "__main__":

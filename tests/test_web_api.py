@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from crawler_state import CrawlerState
 from main import JobController
@@ -53,6 +54,18 @@ class WebApiTests(unittest.TestCase):
             family = payload["multi_versions"][0]
             self.assertEqual(family["latest_document_key"], "ccdi:2")
             self.assertEqual(len(family["versions"]), 2)
+            with patch.object(
+                controller,
+                "cancel_all_parsing",
+                return_value={
+                    "cancelled": 3,
+                    "datasets": {},
+                    "errors": [],
+                },
+            ):
+                response = client.post("/api/cancel_parsing")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()["cancelled"], 3)
 
 
 if __name__ == "__main__":

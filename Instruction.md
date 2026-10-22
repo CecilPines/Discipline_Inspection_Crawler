@@ -118,11 +118,10 @@ upload:
   strategy: "interval"  # interval=每 N 天把所有未上传文件一次性传走；age=每天只传满 min_age_days 的文件
   interval_days: 3      # interval 策略的周期（天）
   min_age_days: 3       # 仅 age 策略使用
-  max_parsing_documents: 500  # 单波最多同时解析的文档数
-  parse_timeout_minutes: 30   # 单波最长等待；超时文件取消解析并进入重试
+  max_parsing_documents: 30   # 滚动窗口最多同时解析的文档数
   parse_poll_seconds: 10
-  parse_retry_rounds: 1
-  upload_batch_size: 5
+  parse_retry_rounds: 3        # 服务器返回 FAIL 后最多重试 3 次
+  parse_retry_interval_minutes: 10
 crawl:
   # 每条之间的随机间隔（秒）：min~max 之间随机取值，避免固定节奏被识别
   request_delay_min_seconds: 1.0        # 中纪检（有反爬）
@@ -845,7 +844,7 @@ ps -ef | grep "[m]ain.py"     # 有几个 main.py
 - 迁库复用重启时的索引准备流程；若日期和最终索引已经就绪，就跳过联网补录，直接进入删库、重建和上传阶段，不会用缺日期的中间索引决定上传版本。
 - 校纪检日期完成后，其版本索引在后台线程中建立；中纪检日期补录继续运行，两件事并行。
 - 上传只取每个标题族的最新版本。最新版本解析完成后，程序根据版本记录里的 RAGFlow 文档 ID 删除旧版本。
-- 上传按 `upload.max_parsing_documents` 分波，一波全部完成后再开始下一波；单波超过 `parse_timeout_minutes` 的文档会取消解析、让后续文件继续，再按 `parse_retry_rounds` 重新触发。失败/超时 ID 显示在学科智能体旁的「上传与解析」卡片。
+- 上传使用滚动解析窗口：`RUNNING/UNSTART/PENDING` 合计不超过 `upload.max_parsing_documents`（默认 30）；任一文件完成后立即上传并启动下一个。长时间未完成会持续等待，不设超时、不取消。只有服务器明确返回 `FAIL` 才按 `parse_retry_interval_minutes` 定期重试，最多 3 次；最终失败 ID 显示在对应学科智能体卡片。
 - 历史记录下方按标题族展示多版本，可展开/收起；每个版本显示链接后缀、标题、位置与发布日期，并标注最新版本。
 
 **失败编号什么时候重试？**
