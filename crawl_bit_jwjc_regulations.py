@@ -32,6 +32,7 @@ from crawl_common import (
     wait_while_paused,
 )
 from crawler_state import CrawlerState
+from regulation_versions import parse_date_value
 
 logger = logging.getLogger(__name__)
 
@@ -175,9 +176,175 @@ def collect_bit_items(index_html: str | None = None) -> tuple[list[BitListItem],
     return all_items, declared_total
 
 
-def _bit_filename(seq: int, title: str) -> str:
-    """校纪检文件名：`[序号] 标题.pdf`（序号与站点列表顺序一致）。"""
+def _bit_filename(seq: int, title: str, publish_date: str = "") -> str:
+    """校纪检文件名：`[序号] 标题.pdf`；不再自动追加日期后缀。"""
+    del publish_date
     return fit_filename(f"[{seq}] ", sanitize_filename(title))
+
+
+def backfill_bit_publish_dates(
+    state: CrawlerState,
+    *,
+    rebuild_index: bool = True,
+    stop_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+) -> int:
+    """分页补写校纪检发布日期；检查点记录下一页，重启不会从头翻。"""
+    before = state.snapshot().get("documents", {})
+    bit_rows = [
+        meta
+        for key, meta in before.items()
+        if str(key).startswith("bit:") and isinstance(meta, dict)
+    ]
+    bit_total = len(bit_rows)
+    dated_count = sum(1 for meta in bit_rows if meta.get("publish_date"))
+    index_html = _fetch_html(BIT_INDEX)
+    declared_total = _parse_declared_total(index_html)
+    page_urls = _list_page_urls(index_html)
+    page_count = len(page_urls)
+    status = ((before and state.snapshot().get("backfill_status", {}).get("bit", {})) or {})
+    can_resume = str(status.get("status") or "") in {
+        "running",
+        "error",
+        "interrupted",
+    }
+    try:
+        start_page = (
+            int(status.get("next_page") or status.get("page") or 1)
+            if can_resume
+            and (
+                status.get("total_declared") in (None, declared_total)
+                or declared_total is None
+            )
+            else 1
+        )
+    except (TypeError, ValueError):
+        start_page = 1
+    start_page = min(max(1, start_page), page_count + 1)
+    state.set_backfill_status(
+        "bit",
+        status="running",
+        current=dated_count,
+        total=bit_total,
+        message=(
+            f"校纪检日期补录：从第 {start_page}/{page_count} 页继续"
+            if start_page > 1
+            else "校纪检日期补录：正在读取目录页…"
+        ),
+        extra={
+            "page": max(1, start_page - 1),
+            "next_page": start_page,
+            "page_count": page_count,
+            "total_declared": declared_total,
+        },
+    )
+    known = state.snapshot().get("documents", {})
+    signatures = dict(state.get_source_entry_signatures("bit"))
+    update_count = 0
+    interrupted = False
+    for page_index in range(start_page, page_count + 1):
+        if stop_event and stop_event.is_set():
+            interrupted = True
+            break
+        wait_while_paused(pause_event, stop_event)
+        html = (
+            index_html
+            if page_urls[page_index - 1] == BIT_INDEX
+            else _fetch_html(page_urls[page_index - 1])
+        )
+        for item in _parse_list_page(html):
+            key = f"bit:{item.slug}"
+            signatures[item.slug] = {
+                "title": item.title,
+                "publish_date": parse_date_value(item.publish_date),
+                "url": item.detail_url,
+            }
+            meta = known.get(key)
+            if not isinstance(meta, dict):
+                continue
+            fields = {}
+            if item.publish_date:
+                fields["publish_date"] = parse_date_value(item.publish_date)
+                fields["date_precision"] = (
+                    "day"
+                    if len(parse_date_value(item.publish_date)) == 10
+                    else "year"
+                )
+            if not meta.get("title"):
+                fields["title"] = item.title
+            if fields:
+                state.update_document_metadata(
+                    key, fields, rebuild_index=rebuild_index
+                )
+                update_count += 1
+        state.set_source_entry_signatures("bit", signatures)
+        after = state.snapshot().get("documents", {})
+        dated_count = sum(
+            1
+            for key, meta in after.items()
+            if str(key).startswith("bit:")
+            and isinstance(meta, dict)
+            and meta.get("publish_date")
+        )
+        state.set_backfill_status(
+            "bit",
+            status="running",
+            current=dated_count,
+            total=bit_total,
+            message=(
+                f"校纪检目录第 {page_index}/{page_count} 页，"
+                f"日期已完成 {dated_count}/{bit_total} 条"
+            ),
+            extra={
+                "page": page_index,
+                "next_page": min(page_index + 1, page_count + 1),
+                "page_count": page_count,
+                "total_declared": declared_total,
+            },
+        )
+        state.save_backfill_checkpoint(
+            "bit",
+            status="running",
+            current=dated_count,
+            total=bit_total,
+            message=f"校纪检目录已核对到第 {page_index}/{page_count} 页",
+            page=page_index,
+            next_page=min(page_index + 1, page_count + 1),
+            page_count=page_count,
+            total_declared=declared_total,
+        )
+    after = state.snapshot().get("documents", {})
+    after_rows = [
+        meta
+        for key, meta in after.items()
+        if str(key).startswith("bit:") and isinstance(meta, dict)
+    ]
+    final_dated = sum(1 for meta in after_rows if meta.get("publish_date"))
+    resume_page = int(
+        state.snapshot()
+        .get("backfill_status", {})
+        .get("bit", {})
+        .get("next_page", page_count + 1)
+    )
+    state.set_backfill_status(
+        "bit",
+        status="interrupted" if interrupted else "done",
+        current=final_dated,
+        total=len(after_rows),
+        message=(
+            f"校纪检日期补录已中断，重启后从第 {resume_page} 页继续"
+            if interrupted
+            else f"校纪检日期补录完成，更新 {update_count} 条"
+        ),
+        extra={
+            "page_count": page_count,
+            "next_page": resume_page if interrupted else page_count + 1,
+            "total_declared": declared_total,
+        },
+    )
+    if not interrupted:
+        state.clear_backfill_checkpoint("bit")
+    return update_count
 
 
 def crawl_bit_jwjc_regulations(
@@ -204,35 +371,13 @@ def crawl_bit_jwjc_regulations(
     delay_range = normalize_seconds_range(request_delay_seconds, default=(1.0, 1.0))
 
     state.set_progress("bit", status="running", message="正在检查目录页…", note="")
-    # 每日增量：先看目录页「共 N 条」有没有变化，没变就不抓详情页
+    # 每日增量：总条数只作提示；始终逐条核对标题与日期，防止同条数替换漏抓。
     index_html = _fetch_html(BIT_INDEX)
     declared_total = _parse_declared_total(index_html)
     stored_total = state.get_source_total("bit")
-    if (
-        max_items is None
-        and declared_total is not None
-        and stored_total is not None
-        and declared_total == stored_total
-    ):
-        logger.info(
-            "校纪检无更新：目录页声明 %s 条，与上次记录一致，跳过本轮",
-            declared_total,
-        )
-        # 检查很快，稍微停一下让界面轮询能看到"运行中"再结束
-        time.sleep(1.5)
-        state.set_progress(
-            "bit",
-            status="idle",
-            message=f"无更新（目录页共 {declared_total} 条，与上次一致）",
-        )
-        state.set_last_crawl("bit")
-        # 目录条数没变 = 这一轮校纪检也是完整核对过的，必须记 pass_done，
-        # 否则「首次执行」永远清不掉
-        state.mark_pass_done("bit")
-        return 0
     if declared_total is not None and stored_total is not None:
         logger.info(
-            "校纪检目录条数变化：%s -> %s，开始增量抓取",
+            "校纪检目录条数：%s -> %s；无论条数是否变化，都继续核对标题和日期",
             stored_total,
             declared_total,
         )
@@ -247,22 +392,91 @@ def crawl_bit_jwjc_regulations(
         for d in state.snapshot().get("documents", {}).values()
         if d.get("source") == "bit"
     )
-    # 只保留“还没爬过（或本地 PDF 已丢失）”的条目，保证测试模式每次取到的是新的 N 条
+    # 每次都要核对标题与日期。总数不变也可能发生“同条数替换”，不能仅凭 total 跳过。
     known = state.snapshot().get("documents", {})
-    pending_items = [
-        item
-        for item in catalog_all
-        if not (
-            known.get(f"bit:{item.slug}")
-            and path_exists(Path(known[f"bit:{item.slug}"]["pdf_path"]))
-        )
-    ]
+    old_signatures = state.get_source_entry_signatures("bit")
+    signatures: dict[str, dict] = {}
+    pending_items: list[tuple[BitListItem, bool]] = []
+    stable_signatures: dict[str, dict] = {}
+    metadata_updates = 0
+    changed_count = 0
+    for item in catalog_all:
+        key = f"bit:{item.slug}"
+        existing = known.get(key)
+        signature = {
+            "title": item.title,
+            "publish_date": parse_date_value(item.publish_date),
+            "url": item.detail_url,
+        }
+        signatures[item.slug] = signature
+        old_sig = old_signatures.get(item.slug) or {}
+        if existing and path_exists(Path(existing.get("pdf_path") or "")):
+            old_title = str(existing.get("title") or "")
+            old_date = parse_date_value(
+                existing.get("publish_date"), existing.get("publish_year")
+            )
+            if old_sig:
+                changed = any(old_sig.get(k) != v for k, v in signature.items())
+            else:
+                changed = old_title != item.title or bool(
+                    old_date
+                    and signature["publish_date"]
+                    and old_date != signature["publish_date"]
+                )
+            if changed:
+                pending_items.append((item, True))
+                changed_count += 1
+            else:
+                stable_signatures[item.slug] = signature
+                updates = {
+                    "title": item.title,
+                    "url": item.detail_url,
+                }
+                if signature["publish_date"]:
+                    updates["publish_date"] = signature["publish_date"]
+                    updates["date_precision"] = (
+                        "day" if len(signature["publish_date"]) == 10 else "year"
+                    )
+                before = (old_title, old_date)
+                state.update_document_metadata(key, updates)
+                if before != (
+                    item.title,
+                    parse_date_value(updates.get("publish_date", old_date)),
+                ):
+                    metadata_updates += 1
+        else:
+            pending_items.append((item, bool(existing)))
     logger.info(
-        "校纪检待爬 %s 条（列表共 %s 条，已爬 %s 条）",
+        "校纪检待爬 %s 条（列表共 %s 条，已登记 %s 条，标题/日期变更 %s 条）",
         len(pending_items),
         len(catalog_all),
         base,
+        changed_count,
     )
+    confirmed_signatures = {**old_signatures, **stable_signatures}
+
+    if not pending_items:
+        logger.info(
+            "校纪检无新增或变更：已核对 %s 条标题与发布日期%s",
+            len(catalog_all),
+            f"，补写日期 {metadata_updates} 条" if metadata_updates else "",
+        )
+        state.set_progress(
+            "bit",
+            status="idle",
+            current=base,
+            total=max(declared_total or 0, base),
+            message=(
+                f"完成，本次新增 0 个（已逐条核对 {len(catalog_all)} 条标题与日期）"
+            ),
+        )
+        if declared_total is not None:
+            state.set_source_total("bit", declared_total)
+        state.set_source_entry_signatures("bit", signatures)
+        state.mark_pass_done("bit")
+        state.set_last_crawl("bit")
+        return 0
+
     if max_items and max_items > 0:
         catalog = pending_items[:max_items]
         done = 0
@@ -287,7 +501,7 @@ def crawl_bit_jwjc_regulations(
         browser_channel=browser_channel,
         stealth=stealth,
     ) as exporter:
-        for item in catalog:
+        for item, changed in catalog:
             if stop_event and stop_event.is_set():
                 logger.info("校纪检爬取被用户终止")
                 aborted = True
@@ -304,14 +518,16 @@ def crawl_bit_jwjc_regulations(
                 progress_callback(done + 1, total, msg)
 
             existing = state.snapshot()["documents"].get(doc_key)
-            if existing and path_exists(Path(existing["pdf_path"])):
+            if existing and path_exists(Path(existing["pdf_path"])) and not changed:
                 continue
 
             # 文件名一律用导航页链接文字（哪怕带「...」也原样保留）
             title = item.title
 
             # 文件名前加站点顺序编号，方便和 index*.htm 上的条目一一对照
-            filename = _bit_filename(seq_by_slug.get(item.slug, 0), title)
+            filename = _bit_filename(
+                seq_by_slug.get(item.slug, 0), title, item.publish_date
+            )
             candidate = root / filename
             record = state.snapshot()["documents"].get(doc_key)
             if candidate.exists() and not (record and Path(record["pdf_path"]) == candidate):
@@ -334,17 +550,47 @@ def crawl_bit_jwjc_regulations(
                 state.set_progress("bit", message=f"失败 {item.detail_url}: {exc}")
                 continue
 
-            if state.register_document(
+            existing_now = state.snapshot()["documents"].get(doc_key)
+            if existing_now:
+                state.update_document_version(
+                    doc_key,
+                    source="bit",
+                    title=title,
+                    url=item.detail_url,
+                    pdf_path=str(pdf_path.resolve()),
+                    category_path="校纪检",
+                    publish_date=item.publish_date,
+                    date_precision=(
+                        "day" if parse_date_value(item.publish_date) else ""
+                    ),
+                    link_suffix=item.slug,
+                    count_as_new=changed,
+                )
+                if changed:
+                    new_count += 1
+                    done += 1
+                    state.set_progress("bit", current=done)
+            elif state.register_document(
                 doc_key,
                 source="bit",
                 title=title,
                 url=item.detail_url,
                 pdf_path=str(pdf_path.resolve()),
                 category_path="校纪检",
+                publish_date=item.publish_date,
+                date_precision=(
+                    "day" if parse_date_value(item.publish_date) else ""
+                ),
+                link_suffix=item.slug,
             ):
                 new_count += 1
                 done += 1
                 state.set_progress("bit", current=done)
+            confirmed_signatures[item.slug] = {
+                "title": item.title,
+                "publish_date": parse_date_value(item.publish_date),
+                "url": item.detail_url,
+            }
 
             if delay_range[1] > 0:
                 sleep_with_stop(random_delay(delay_range), stop_event, pause_event)
@@ -357,5 +603,6 @@ def crawl_bit_jwjc_regulations(
             state.set_source_total("bit", declared_total)
         # 完整跑完一遍（首次运行据此判断能否收尾）
         state.mark_pass_done("bit")
+    state.set_source_entry_signatures("bit", confirmed_signatures)
     state.set_last_crawl("bit")
     return new_count

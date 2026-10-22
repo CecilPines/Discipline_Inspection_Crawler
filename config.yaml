@@ -109,6 +109,15 @@ upload:
   interval_days: 3
   min_age_days: 3
   max_age_days: 4
+  # 解析并发窗口：一波最多上传/解析多少个文档，等待该波结束再继续下一波
+  max_parsing_documents: 500
+  # 单个解析窗口的最长等待时间；超时文件取消解析并排入后续重试
+  parse_timeout_minutes: 30
+  parse_poll_seconds: 10
+  # 所有新文件上传完成后，对超时/失败文件重新触发解析的轮数
+  parse_retry_rounds: 1
+  # 每次 HTTP 上传请求包含的文件数（不影响 500 的解析并发上限）
+  upload_batch_size: 5
 
 # RAGFlow（与 ragflow_kb_manager.py 中接口一致，可通过环境变量 RAGFLOW_API_KEY 覆盖）
 ragflow:

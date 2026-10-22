@@ -39,6 +39,7 @@ from crawl_common import (
     wait_while_paused,
 )
 from crawler_state import CrawlerState
+from regulation_versions import parse_date_value
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +200,23 @@ def _throttle_recovered(state: CrawlerState | None = None) -> None:
         _throttle_resume_at = None
     if state is not None:
         state.clear_throttle_state("ccdi")
+        state.set_backfill_status(
+            "ccdi",
+            extra={
+                "throttle_message": "",
+                "throttle_resume_at": "",
+                "throttle_round": 0,
+                "throttle_max_rounds": 0,
+            },
+            persist=False,
+        )
+        state.save_backfill_checkpoint(
+            "ccdi",
+            throttle_message="",
+            throttle_resume_at="",
+            throttle_round=0,
+            throttle_max_rounds=0,
+        )
 
 
 def _throttle_backoff(
@@ -209,6 +227,7 @@ def _throttle_backoff(
     max_rounds: int,
     what: str,
     visit_extra: dict | None = None,
+    context: str = "crawl",
 ) -> str:
     """遇到限流页后的退避等待。
 
@@ -235,6 +254,16 @@ def _throttle_backoff(
                 _throttle_resume_at = None
                 if state is not None:
                     state.clear_throttle_state("ccdi")
+                    if context == "date_backfill":
+                        state.set_backfill_status(
+                            "ccdi",
+                            extra={
+                                "throttle_message": (
+                                    f"日期补录连续 {max_rounds} 次限流退避后仍被限流"
+                                ),
+                                "throttle_resume_at": "",
+                            },
+                        )
                 return "exhausted"
             _throttle_round += 1
             round_no = _throttle_round
@@ -266,20 +295,42 @@ def _throttle_backoff(
         )
     if state is not None:
         state.set_throttle_state(
-            "ccdi", round_no=round_no, resume_at=retry_stamp
+            "ccdi",
+            round_no=round_no,
+            resume_at=retry_stamp,
+            context=context,
         )
     if state is not None:
-        state.set_progress(
-            "ccdi",
-            message=(
-                f"继续上次未完成的限流等待：还剩 {wait / 60:.1f} 分钟"
-                f"（第 {round_no}/{max_rounds or '∞'} 次，原定 {retry_stamp} 重试）…"
-                if resumed
-                else f"站点限流（请求过于频繁），暂停 {wait / 60:.1f} 分钟后重试"
-                f"（第 {round_no}/{max_rounds or '∞'} 次，预计 {retry_stamp}）…"
-            ),
-            extra=visit_extra or {},
+        progress_message = (
+            f"继续上次未完成的限流等待：还剩 {wait / 60:.1f} 分钟"
+            f"（第 {round_no}/{max_rounds or '∞'} 次，原定 {retry_stamp} 重试）…"
+            if resumed
+            else f"站点限流（请求过于频繁），暂停 {wait / 60:.1f} 分钟后重试"
+            f"（第 {round_no}/{max_rounds or '∞'} 次，预计 {retry_stamp}）…"
         )
+        if context == "date_backfill":
+            state.set_backfill_status(
+                "ccdi",
+                extra={
+                    "throttle_message": progress_message,
+                    "throttle_resume_at": retry_stamp,
+                    "throttle_round": round_no,
+                    "throttle_max_rounds": max_rounds,
+                },
+            )
+            state.save_backfill_checkpoint(
+                "ccdi",
+                throttle_message=progress_message,
+                throttle_resume_at=retry_stamp,
+                throttle_round=round_no,
+                throttle_max_rounds=max_rounds,
+            )
+        else:
+            state.set_progress(
+                "ccdi",
+                message=progress_message,
+                extra=visit_extra or {},
+            )
     finished = sleep_with_stop(wait, stop_event, pause_event)
     if finished:
         # 等到点了：清掉到点标记（轮次保留，成功后会整体归零）
@@ -681,31 +732,43 @@ def _recover_index(
 
 
 def _goto_list_page_number(
-    page: Page, page_num: int, stop_event: threading.Event | None = None
+    page: Page,
+    page_num: int,
+    stop_event: threading.Event | None = None,
+    *,
+    force_page_one: bool = False,
 ) -> bool:
     """翻到指定页码；返回是否成功（失败只记日志，由调用方决定是否中断该分类）。"""
-    if page_num <= 1:
+    if page_num <= 1 and not force_page_one:
         return True
     # 站点每 7 个页码为一组展示，cstart 为该组的起始页码。
     cstart = ((page_num - 1) // 7) * 7 + 1
     try:
-        called = page.evaluate(
-            """([p, cstart]) => {
-                if (typeof submitForm_1 === 'function') {
-                    submitForm_1(p, cstart);
-                    return true;
-                }
-                return false;
-            }""",
-            [page_num, cstart],
-        )
+        if not page.evaluate("() => typeof submitForm_1 === 'function'"):
+            # 当前不在列表页（例如刚导出 PDF、页面停在详情页）。
+            logger.warning("当前页面没有分页函数（%s），无法翻到第 %s 页", page.url, page_num)
+            return False
+        # 必须等表单提交真正产生导航；只等旧页面 load 或固定 sleep
+        # 会把“未翻页”误判为成功，随后重复读取上一页。
+        with page.expect_navigation(
+            wait_until="domcontentloaded", timeout=20_000
+        ):
+            called = page.evaluate(
+                """([p, cstart]) => {
+                    if (typeof submitForm_1 === 'function') {
+                        submitForm_1(p, cstart);
+                        return true;
+                    }
+                    return false;
+                }""",
+                [page_num, cstart],
+            )
     except Exception as exc:
         if is_browser_closed_error(exc):
             raise BrowserConnectionClosed(str(exc)) from exc
-        logger.warning("翻到第 %s 页失败：%s", page_num, exc)
+        logger.warning("翻到第 %s 页未发生导航或等待超时：%s", page_num, exc)
         return False
     if not called:
-        # 当前不在类目列表页（例如刚导出 PDF、页面停在详情页），无法调用分页函数
         logger.warning("当前页面没有分页函数（%s），无法翻到第 %s 页", page.url, page_num)
         return False
     try:
@@ -947,6 +1010,11 @@ def _export_item(
         or exporter.page
     )
 
+    try:
+        extracted_date = _extract_ccdi_publish_date(used_page.content())
+        publish_date = extracted_date[:4] if extracted_date else ""
+    except Exception:
+        publish_date = ""
     # 详情页导出后额外歇 1~2 秒（可配置），别紧接着开下一个页面
     if detail_delay and detail_delay[1] > 0:
         sleep_with_stop(random_delay(detail_delay), stop_event, pause_event)
@@ -972,12 +1040,21 @@ def _export_item(
         url=item.detail_url,
         pdf_path=str(pdf_path.resolve()),
         category_path=f"{main_cat}/{sub_cat}",
+        publish_date=publish_date,
+        date_precision="year" if publish_date else "",
+        link_suffix=item.doc_id,
     )
     if registered:
         return "new"
     if missing_pdf:
         # 记录在但 PDF 丢了：把路径修正回磁盘上的实际文件，避免每轮重复导出
         state.mark_pdf_path(doc_key, str(pdf_path.resolve()))
+        if publish_date:
+            state.set_document_publish_date(
+                doc_key,
+                publish_date,
+                precision="day" if len(publish_date) == 10 else "year",
+            )
         return "refreshed"
     return "exists"
 
@@ -1945,6 +2022,25 @@ def _parse_display_page(html: str) -> tuple[str, str, str] | None:
     return main_cat, sub_cat, title
 
 
+def _extract_ccdi_publish_date(source: str) -> str:
+    """从详情页 HTML 提取发布日期；找不到时返回空串。"""
+    if not source:
+        return ""
+    text = BeautifulSoup(source, "lxml").get_text(" ", strip=True)
+    # 优先匹配带“发布”字样的日期，避免把正文中的年份误当成发布日期。
+    for pattern in (
+        r"发布(?:时间|日期)?\s*[：:]?\s*((?:19|20)\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2})",
+        r"((?:19|20)\d{2}[-/.]\d{1,2}[-/.]\d{1,2})",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            parsed = parse_date_value(match.group(1))
+            if parsed:
+                return parsed
+    match = re.search(r"发布(?:时间|日期)?\s*[：:]?\s*((?:19|20)\d{2})", text)
+    return parse_date_value(match.group(1)) if match else ""
+
+
 def _is_invalid_display_page(html: str) -> bool:
     """站点对不存在的编号会返回「输入有误请…返回」的提示页。"""
     if not html:
@@ -2104,6 +2200,1582 @@ def _search_by_year(
     )
 
 
+def _extract_search_years(values: list | tuple) -> list[int]:
+    """从高级检索 #fbrq 的选项值/文本中提取降序年份。"""
+    years: set[int] = set()
+    for value in values or []:
+        match = re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)", str(value))
+        if match:
+            years.add(int(match.group(1)))
+    return sorted(years, reverse=True)
+
+
+def _extract_result_total_count(html: str) -> int | None:
+    """优先读取高级检索的“检索数量：N”，再兼容“共 N 条”。"""
+    text = BeautifulSoup(html or "", "lxml").get_text(" ", strip=True)
+    for pattern in (
+        r"检索数量\s*[：:]\s*(\d+)",
+        r"共\s*(\d+)\s*条",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _exact_result_count(
+    page_count: int, page_size: int, last_page_count: int
+) -> int:
+    """按 (总页数-1)*每页条数+末页条数计算精确条数。"""
+    pages = max(1, int(page_count))
+    per_page = max(0, int(page_size))
+    last = max(0, int(last_page_count))
+    if pages <= 1:
+        return last
+    return (pages - 1) * per_page + last
+
+
+def _update_incomplete_year(
+    records: list[dict[str, Any]],
+    *,
+    year: int,
+    page: int,
+    crawled: int,
+    expected: int,
+    year_total: int | None,
+    complete: bool,
+) -> list[dict[str, Any]]:
+    """更新未完整页记录；页面补全后自动移除。"""
+    result = [dict(item) for item in records if isinstance(item, dict)]
+    def _as_int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    entry = next((item for item in result if _as_int(item.get("year")) == year), None)
+    if entry is None:
+        entry = {"year": year, "year_total": year_total, "pages": []}
+        result.append(entry)
+    pages = [
+        item
+        for item in entry.get("pages", [])
+        if _as_int(item.get("page")) != page
+    ]
+    if not complete:
+        pages.append(
+            {
+                "page": page,
+                "crawled": crawled,
+                "expected": expected,
+            }
+        )
+    entry["pages"] = pages
+    entry["year_total"] = year_total
+    return [item for item in result if item.get("pages")]
+
+
+def _year_rows_from_state(
+    years: list[int],
+    completed_years: set[int],
+    incomplete_years: list[dict[str, Any]],
+    existing_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    existing = {
+        int(row.get("year")): dict(row)
+        for row in (existing_rows or [])
+        if isinstance(row, dict)
+        and str(row.get("year", "")).isdigit()
+    }
+    incomplete = {
+        int(row.get("year")): row
+        for row in incomplete_years
+        if str(row.get("year", "")).isdigit()
+    }
+    rows: list[dict[str, Any]] = []
+    for year in years:
+        row = existing.get(
+            year,
+            {
+                "year": year,
+                "status": "pending",
+                "page": 0,
+                "page_count": 0,
+                "year_total_count": None,
+                "year_scanned": 0,
+                "year_filled": 0,
+                "pages": [],
+                "page_results": [],
+                "unmatched_web_ids": [],
+                "message": "",
+            },
+        )
+        if year in incomplete:
+            pages = incomplete[year].get("pages") or []
+            row.update(
+                {
+                    "status": "partial",
+                    "pages": pages,
+                    "year_total_count": incomplete[year].get("year_total"),
+                    "message": f"{len(pages)} 个页面未爬完整",
+                }
+            )
+        elif year in completed_years:
+            row["status"] = "done"
+        rows.append(row)
+    return rows
+
+
+def _update_year_row(
+    rows: list[dict[str, Any]], year: int, **fields: Any
+) -> list[dict[str, Any]]:
+    result = [dict(row) for row in rows]
+    entry = next(
+        (row for row in result if str(row.get("year")) == str(year)),
+        None,
+    )
+    if entry is None:
+        entry = {"year": year}
+        result.append(entry)
+    entry.update({key: value for key, value in fields.items() if value is not None})
+    return result
+
+
+def _update_page_result(
+    rows: list[dict[str, Any]],
+    year: int,
+    page: int,
+    crawled: int,
+    expected: int,
+    complete: bool,
+    web_ids: list[int] | None = None,
+    matched_local_ids: list[str] | None = None,
+    matched_local_keys: list[str] | None = None,
+    unmatched_ids: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    result = [dict(row) for row in rows]
+    entry = next(
+        (row for row in result if str(row.get("year")) == str(year)),
+        None,
+    )
+    if entry is None:
+        entry = {"year": year, "page_results": []}
+        result.append(entry)
+    previous = next(
+        (
+            item
+            for item in entry.get("page_results", [])
+            if str(item.get("page")) == str(page)
+        ),
+        {},
+    )
+    crawled = max(int(crawled), int(previous.get("crawled") or 0))
+    if web_ids is None:
+        web_ids = previous.get("web_ids") or []
+    if matched_local_ids is None:
+        matched_local_ids = previous.get("matched_local_ids") or []
+    if matched_local_keys is None:
+        matched_local_keys = previous.get("matched_local_keys") or []
+    if unmatched_ids is None:
+        unmatched_ids = previous.get("unmatched_ids") or []
+    pages = [
+        dict(item)
+        for item in entry.get("page_results", [])
+        if str(item.get("page")) != str(page)
+    ]
+    pages.append(
+        {
+            "page": page,
+            "crawled": crawled,
+            "expected": expected,
+            "complete": complete,
+            "web_ids": sorted(set(web_ids or [])),
+            "matched_local_ids": sorted(set(matched_local_ids or [])),
+            "matched_local_keys": sorted(set(matched_local_keys or [])),
+            "unmatched_ids": sorted(set(unmatched_ids or [])),
+        }
+    )
+    pages.sort(key=lambda item: int(item.get("page") or 0))
+    entry["page_results"] = pages
+    return result
+
+
+def _local_ccdi_keys_by_year(
+    documents: dict[str, dict[str, Any]]
+) -> dict[int, set[str]]:
+    """按状态日期或文件名日期统计本地中纪检文件所属年份。"""
+    result: dict[int, set[str]] = {}
+    for doc_key, meta in documents.items():
+        if meta.get("source") != "ccdi":
+            continue
+        if meta.get("date_source") == "filename":
+            # 文件名年份只作临时兜底，不参与网页数量比对。
+            continue
+        year = ""
+        parsed = parse_date_value(meta.get("publish_date"))
+        if parsed:
+            year = parsed[:4]
+        if not year:
+            filename = Path(str(meta.get("pdf_path") or "")).stem
+            match = re.search(r"_(?P<year>(?:19|20)\d{2})(?:\d{4})?(?:_\d+)?$", filename)
+            if match:
+                year = match.group("year")
+        if year.isdigit():
+            result.setdefault(int(year), set()).add(str(doc_key))
+    return result
+
+
+def audit_ccdi_match_dates(
+    state: CrawlerState, *, repair: bool = True
+) -> dict[str, Any]:
+    """核对网页编号唯一性、重复年份以及匹配文件日期是否真正落盘。"""
+
+    def collect(snapshot: dict[str, Any]) -> dict[str, Any]:
+        rows = [
+            row
+            for row in (
+                ((snapshot.get("backfill_status") or {}).get("ccdi") or {}).get(
+                    "year_rows"
+                )
+                or []
+            )
+            if isinstance(row, dict)
+        ]
+        documents = snapshot.get("documents") or {}
+        web_years: dict[int, set[int]] = {}
+        web_year_occurrences: dict[tuple[int, int], int] = {}
+        matched_ids: set[int] = set()
+        matched_keys: set[str] = set()
+        unmatched_ids: set[int] = set()
+        web_occurrences = 0
+        matched_occurrences = 0
+        years_without_page_audit: list[str] = []
+
+        def numeric_id_values(values: Any) -> list[int]:
+            result: list[int] = []
+            for value in values or []:
+                match = re.fullmatch(
+                    r"(?:ccdi:)?(\d+)", str(value or "").strip()
+                )
+                if match:
+                    result.append(int(match.group(1)))
+            return result
+
+        def numeric_ids(values: Any) -> set[int]:
+            return set(numeric_id_values(values))
+
+        for row in rows:
+            year_value = str(row.get("year") or "")
+            try:
+                year = int(year_value)
+            except ValueError:
+                continue
+            pages = [
+                page
+                for page in (row.get("page_results") or [])
+                if isinstance(page, dict)
+            ]
+            if not pages:
+                years_without_page_audit.append(year_value)
+            for page in pages:
+                page_web_id_values = numeric_id_values(
+                    page.get("web_ids") or []
+                )
+                page_web_ids = set(page_web_id_values)
+                page_matched_ids = numeric_ids(
+                    page.get("matched_local_ids") or []
+                )
+                web_occurrences += len(page_web_id_values)
+                matched_occurrences += len(page_matched_ids)
+                matched_ids.update(page_matched_ids)
+                matched_keys.update(
+                    {
+                        str(key)
+                        for key in (page.get("matched_local_keys") or [])
+                        if str(key).strip()
+                    }
+                )
+                unmatched_ids.update(
+                    numeric_ids(page.get("unmatched_ids") or [])
+                )
+                for web_id in page_web_ids:
+                    web_years.setdefault(web_id, set()).add(year)
+                for web_id in page_web_id_values:
+                    occurrence_key = (year, web_id)
+                    web_year_occurrences[occurrence_key] = (
+                        web_year_occurrences.get(occurrence_key, 0) + 1
+                    )
+            unmatched_ids.update(
+                numeric_ids(row.get("unmatched_web_ids") or [])
+            )
+
+        repeated_ids = sorted(
+            web_id
+            for web_id, years in web_years.items()
+            if len(years) > 1
+        )
+        dated_ids: set[int] = set()
+        missing_date_ids: set[int] = set()
+        wrong_year_ids: set[int] = set()
+        missing_local_ids: set[int] = set()
+        for web_id in sorted(matched_ids):
+            meta = documents.get(f"ccdi:{web_id}")
+            if not isinstance(meta, dict):
+                missing_local_ids.add(web_id)
+                continue
+            publish_date = parse_date_value(meta.get("publish_date"))
+            years = web_years.get(web_id, set())
+            if not publish_date:
+                missing_date_ids.add(web_id)
+            elif years and int(publish_date[:4]) not in years:
+                wrong_year_ids.add(web_id)
+            else:
+                dated_ids.add(web_id)
+
+        return {
+            "documents": documents,
+            "web_years": web_years,
+            "web_year_occurrences": web_year_occurrences,
+            "matched_ids": matched_ids,
+            "matched_keys": matched_keys,
+            "unmatched_ids": unmatched_ids,
+            "web_occurrences": web_occurrences,
+            "matched_occurrences": matched_occurrences,
+            "repeated_ids": repeated_ids,
+            "dated_ids": dated_ids,
+            "missing_date_ids": missing_date_ids,
+            "wrong_year_ids": wrong_year_ids,
+            "missing_local_ids": missing_local_ids,
+            "years_without_page_audit": years_without_page_audit,
+        }
+
+    before = collect(state.snapshot())
+    repair_updates: dict[str, str] = {}
+    if repair:
+        documents = before["documents"]
+        for web_id in sorted(before["matched_ids"]):
+            years = before["web_years"].get(web_id, set())
+            if len(years) != 1:
+                continue
+            doc_key = f"ccdi:{web_id}"
+            meta = documents.get(doc_key)
+            if not isinstance(meta, dict):
+                continue
+            expected_year = str(next(iter(years)))
+            current_year = parse_date_value(meta.get("publish_date"))[:4]
+            if current_year != expected_year:
+                repair_updates[doc_key] = expected_year
+        if repair_updates:
+            state.set_document_publish_dates(
+                repair_updates,
+                precision="year",
+                date_source="web",
+                rebuild_index=False,
+            )
+
+    after = collect(state.snapshot())
+    repeated_count = len(after["repeated_ids"])
+    same_year_repeated_ids = sorted(
+        {
+            web_id
+            for (_, web_id), count in after["web_year_occurrences"].items()
+            if count > 1
+        }
+    )
+    duplicate_occurrence_count = sum(
+        max(0, count - 1)
+        for count in after["web_year_occurrences"].values()
+    )
+    unmatched_count = len(after["unmatched_ids"])
+    missing_date_count = len(after["missing_date_ids"])
+    wrong_year_count = len(after["wrong_year_ids"])
+    missing_local_count = len(after["missing_local_ids"])
+    date_consistent = (
+        missing_date_count == 0
+        and wrong_year_count == 0
+        and missing_local_count == 0
+    )
+    audit_complete = bool(
+        after["web_years"] and not after["years_without_page_audit"]
+    )
+    local_dated_count = sum(
+        1
+        for meta in (after["documents"] or {}).values()
+        if isinstance(meta, dict)
+        and meta.get("source") == "ccdi"
+        and parse_date_value(meta.get("publish_date"))
+    )
+    return {
+        "web_occurrences": after["web_occurrences"],
+        "unique_web_count": len(after["web_years"]),
+        "matched_occurrences": after["matched_occurrences"],
+        "unique_matched_count": len(after["matched_ids"]),
+        "matched_key_count": len(after["matched_keys"]),
+        "repeated_count": repeated_count,
+        "repeated_web_ids": after["repeated_ids"][:200],
+        "same_year_repeated_count": len(same_year_repeated_ids),
+        "same_year_repeated_web_ids": same_year_repeated_ids[:200],
+        "duplicate_occurrence_count": duplicate_occurrence_count,
+        "unmatched_count": unmatched_count,
+        "unmatched_web_ids": sorted(after["unmatched_ids"])[:200],
+        "matched_dated_count": len(after["dated_ids"]),
+        "matched_missing_date_count": missing_date_count,
+        "matched_missing_date_ids": sorted(after["missing_date_ids"])[:200],
+        "matched_wrong_year_count": wrong_year_count,
+        "matched_wrong_year_ids": sorted(after["wrong_year_ids"])[:200],
+        "matched_missing_local_count": missing_local_count,
+        "matched_missing_local_ids": sorted(after["missing_local_ids"])[:200],
+        "years_without_page_audit": after["years_without_page_audit"],
+        "repaired_count": len(repair_updates),
+        "local_dated_count": local_dated_count,
+        "audit_complete": audit_complete,
+        "date_consistent": date_consistent,
+        "consistent": bool(
+            repeated_count == 0
+            and len(same_year_repeated_ids) == 0
+            and unmatched_count == 0
+            and date_consistent
+        ),
+    }
+
+
+def _resume_page_for_year(
+    status: dict, year: int, page_count: int
+) -> tuple[int, dict]:
+    """根据年份断点返回起始页；只恢复同一检查点年份。"""
+    if str(status.get("status") or "") not in {"running", "error", "interrupted"}:
+        return 1, {}
+    if str(status.get("year") or "") != str(year):
+        return 1, {}
+    try:
+        start_page = int(status.get("next_page") or status.get("page") or 1)
+    except (TypeError, ValueError):
+        start_page = 1
+    return min(max(1, start_page), page_count + 1), status
+
+
+def backfill_ccdi_publish_years(
+    state: CrawlerState,
+    *,
+    headless: bool = True,
+    timeout_ms: int = 120_000,
+    browser_channel: str | None = None,
+    stealth: bool = True,
+    stop_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+    max_pages_per_year: int = 200,
+    throttle_wait_ranges: list | None = None,
+    throttle_max_rounds: int = DEFAULT_THROTTLE_ROUNDS,
+    rebuild_index_per_batch: bool = True,
+    request_delay_seconds: float | list | tuple = (1.0, 2.0),
+    force_full: bool = False,
+) -> int:
+    """用高级检索逐年份、逐页补写旧文件的发布年份。
+
+    只读取检索结果列表，不重新导出 PDF。已有完整日期的文件不覆盖。
+    """
+    snap = state.snapshot()
+    id_to_key: dict[int, str] = {}
+    all_key_by_nid: dict[int, str] = {}
+    document_meta_by_key = snap.get("documents") or {}
+    all_ccdi_meta: list[dict] = []
+    matched_local_keys: set[str] = set()
+    for doc_key, meta in (snap.get("documents") or {}).items():
+        if meta.get("source") != "ccdi":
+            continue
+        match = re.fullmatch(r"ccdi:(\d+)", str(doc_key))
+        if not match:
+            continue
+        if isinstance(meta, dict):
+            all_ccdi_meta.append(meta)
+        try:
+            nid = int(match.group(1))
+        except ValueError:
+            continue
+        all_key_by_nid[nid] = str(doc_key)
+        if force_full or not meta.get("publish_date"):
+            id_to_key[nid] = str(doc_key)
+    if not id_to_key:
+        if force_full:
+            state.set_backfill_status(
+                "ccdi",
+                status="done",
+                current=sum(
+                    1 for meta in all_ccdi_meta if meta.get("publish_date")
+                ),
+                total=len(all_ccdi_meta),
+                message="中纪检没有可补录的法规记录",
+                extra={
+                    "force_full": False,
+                    "year_table_version": 2,
+                },
+            )
+            state.clear_backfill_checkpoint("ccdi")
+        return 0
+    wait_ranges = _normalize_wait_ranges(throttle_wait_ranges)
+    page_delay = normalize_seconds_range(
+        request_delay_seconds, default=(1.0, 2.0)
+    )
+
+    def pause_page_access(what: str) -> bool:
+        if page_delay[1] <= 0:
+            return True
+        return sleep_with_stop(
+            random_delay(page_delay),
+            stop_event,
+            pause_event,
+        )
+    initial_dated = sum(1 for meta in all_ccdi_meta if meta.get("publish_date"))
+    total_ccdi = len(all_ccdi_meta)
+    local_keys_by_year = _local_ccdi_keys_by_year(
+        (snap.get("documents") or {})
+    )
+    resume_status = (
+        (snap.get("backfill_status", {}) or {}).get("ccdi", {}) or {}
+    )
+    if force_full:
+        resume_status = {}
+        completed_years = set()
+        incomplete_years = []
+    can_resume = str(resume_status.get("status") or "") in {
+        "running",
+        "error",
+        "interrupted",
+    }
+    completed_years = (
+        {
+            int(value)
+            for value in (
+                (snap.get("backfill_status", {}).get("ccdi", {}) or {}).get(
+                    "completed_years", []
+                )
+                or []
+            )
+            if str(value).isdigit()
+        }
+        if not force_full
+        else set()
+    )
+    incomplete_years: list[dict[str, Any]] = [
+        dict(item)
+        for item in (resume_status.get("incomplete_years") or [])
+        if isinstance(item, dict)
+    ]
+    state.set_backfill_status(
+        "ccdi",
+        status="running",
+        current=initial_dated,
+        total=total_ccdi,
+        message=f"高级检索准备中，待补 {len(id_to_key)} 条",
+    )
+    state.set_progress(
+        "upload",
+        status="running",
+        current=initial_dated,
+        total=total_ccdi,
+        message=f"迁库准备：高级检索补录中纪检历史年份（待补 {len(id_to_key)} 条）…",
+    )
+    changed_total = 0
+    with PlaywrightPdfExporter(
+        headless=headless,
+        timeout_ms=timeout_ms,
+        browser_channel=browser_channel,
+        stealth=stealth,
+    ) as exporter:
+        page = exporter.page
+        if not _safe_goto(page, CCDI_ADVANCED_SEARCH):
+            raise RuntimeError("无法打开中纪检高级检索页")
+        try:
+            page.wait_for_selector("#fbrq", timeout=20_000)
+            raw_years = page.eval_on_selector_all(
+                "#fbrq option",
+                "els => els.map(o => (o.value || o.textContent || '').trim())",
+            )
+        except Exception as exc:
+            raise RuntimeError(f"无法读取高级检索年份选项：{exc}") from exc
+        years = _extract_search_years(raw_years)
+        if not years:
+            raise RuntimeError("高级检索页没有可用的发布年份选项")
+        year_rows = _year_rows_from_state(
+            years,
+            completed_years,
+            incomplete_years,
+            resume_status.get("year_rows"),
+        )
+        totals_known_years = {
+            int(row["year"])
+            for row in year_rows
+            if row.get("year_total_count") is not None
+        }
+        unmatched_web_by_year: dict[int, set[int]] = {}
+        for row in year_rows:
+            try:
+                year_no = int(row.get("year"))
+            except (TypeError, ValueError):
+                continue
+            ids = {
+                int(value)
+                for value in (row.get("unmatched_web_ids") or [])
+                if str(value).isdigit()
+            }
+            if ids:
+                unmatched_web_by_year[year_no] = ids
+        state.set_backfill_status(
+            "ccdi",
+            status="running",
+            current=initial_dated,
+            total=total_ccdi,
+            message="已读取年份列表，准备按年份补录",
+            extra={"years": years, "year_rows": year_rows},
+            persist=False,
+        )
+
+        aborted = False
+        year_positions = {year: index for index, year in enumerate(years, start=1)}
+        work_years = list(years)
+        work_index = 0
+        year_attempts: dict[int, int] = {}
+
+        def queue_year_retry(year: int) -> None:
+            if year in completed_years or not id_to_key:
+                return
+            if year_attempts.get(year, 0) >= 3:
+                return
+            if year not in work_years[work_index:]:
+                work_years.append(year)
+
+        while work_index < len(work_years):
+            year = work_years[work_index]
+            work_index += 1
+            year_index = year_positions.get(year, work_index)
+            year_attempts[year] = year_attempts.get(year, 0) + 1
+            attempt_no = year_attempts[year]
+            if not id_to_key:
+                break
+            if year in completed_years:
+                continue
+            if stop_event and stop_event.is_set():
+                break
+            wait_while_paused(pause_event, stop_event)
+            year_rows = _update_year_row(
+                year_rows,
+                year,
+                status="running",
+                page=0,
+                message=(
+                    "正在提交高级检索"
+                    + (f"（第 {attempt_no}/3 次）" if attempt_no > 1 else "")
+                ),
+            )
+            state.set_progress(
+                "upload",
+                current=initial_dated + changed_total,
+                total=total_ccdi,
+                message=(
+                    f"迁库准备：高级检索 {year} 年"
+                    f"（{year_index}/{len(years)}，第 {attempt_no}/3 次，"
+                    f"已补 {changed_total} 条）"
+                ),
+            )
+            retry_round = 0
+            opened = False
+            while True:
+                if not pause_page_access(f"打开 {year} 年高级检索"):
+                    aborted = True
+                    break
+                if not _safe_goto(page, CCDI_ADVANCED_SEARCH):
+                    logger.warning("补录 %s 年：高级检索页打开失败", year)
+                    break
+                try:
+                    page.wait_for_selector("#fbrq", timeout=20_000)
+                    page.select_option("#fbrq", str(year))
+                    with page.expect_navigation(timeout=45_000):
+                        page.evaluate("document.getElementById('searchFrom0').submit()")
+                except Exception as exc:
+                    logger.warning("补录 %s 年：提交检索失败：%s", year, exc)
+                    break
+                if not pause_page_access(f"{year} 年检索结果加载后停顿"):
+                    aborted = True
+                    break
+                if _is_verification_page(page):
+                    raise RuntimeError("中纪检高级检索触发人机验证，无法补录历史年份")
+                if _is_error_page(page) or _is_throttle_page(page) or _is_maintenance_page(page):
+                    retry_round += 1
+                    decision = _throttle_backoff(
+                        state,
+                        stop_event,
+                        pause_event,
+                        wait_ranges,
+                        throttle_max_rounds,
+                        f"补录 {year} 年发布年份",
+                        context="date_backfill",
+                    )
+                    if decision == "retry" and (
+                        throttle_max_rounds <= 0
+                        or retry_round <= throttle_max_rounds
+                    ):
+                        continue
+                    if decision == "stopped":
+                        aborted = True
+                    logger.warning("补录 %s 年：检索结果页仍被拦截", year)
+                    break
+                _throttle_recovered(state)
+                opened = True
+                break
+            if aborted or (stop_event and stop_event.is_set()):
+                break
+            if not opened:
+                year_rows = _update_year_row(
+                    year_rows,
+                    year,
+                    status="error",
+                    message="高级检索页或结果页读取失败",
+                )
+                incomplete_years = _update_incomplete_year(
+                    incomplete_years,
+                    year=year,
+                    page=1,
+                    crawled=0,
+                    expected=0,
+                    year_total=None,
+                    complete=False,
+                )
+                state.set_backfill_status(
+                    "ccdi",
+                    status="running",
+                    current=initial_dated + changed_total,
+                    total=total_ccdi,
+                    message=f"{year} 年高级检索未成功打开",
+                    extra={
+                        "year_rows": year_rows,
+                        "incomplete_years": incomplete_years,
+                    },
+                )
+                queue_year_retry(year)
+                continue
+            html = _read_list_html(page, stop_event) or ""
+            if not html:
+                queue_year_retry(year)
+                continue
+            page_count = max(1, _parse_max_page(html))
+            year_updates: dict[str, str] = {}
+            year_page_size = 0
+            year_total_count: int | None = None
+            year_filled = 0
+            year_scanned = 0
+            year_complete = True
+            existing_year_row = next(
+                (
+                    row
+                    for row in year_rows
+                    if str(row.get("year")) == str(year)
+                ),
+                {},
+            )
+            page_counts: dict[int, int] = {
+                int(item.get("page") or 0): max(
+                    0, int(item.get("crawled") or 0)
+                )
+                for item in (existing_year_row.get("page_results") or [])
+                if str(item.get("page", "")).isdigit()
+            }
+            year_scanned = max(
+                year_scanned,
+                int(existing_year_row.get("year_scanned") or 0),
+            )
+            year_filled = max(
+                year_filled,
+                int(existing_year_row.get("year_filled") or 0),
+            )
+            start_page, resumed_fields = (
+                _resume_page_for_year(resume_status, year, page_count)
+                if can_resume
+                else (1, {})
+            )
+            if resumed_fields:
+                try:
+                    year_filled = max(
+                        0, int(resumed_fields.get("year_filled") or 0)
+                    )
+                    year_page_size = max(
+                        0, int(resumed_fields.get("year_page_size") or 0)
+                    )
+                    year_scanned = max(
+                        0, int(resumed_fields.get("year_scanned") or 0)
+                    )
+                    if resumed_fields.get("year_total_count") is not None:
+                        year_total_count = int(
+                            resumed_fields.get("year_total_count")
+                        )
+                except (TypeError, ValueError):
+                    pass
+            # 该年总数必须精确：先读第一页每页条数，再读最后一页实际条数。
+            retrieval_total = _extract_result_total_count(html)
+            first_items = _parse_list_items(html)
+            year_page_size = len(first_items)
+            if retrieval_total == 0:
+                year_total_count = 0
+                last_page_count = 0
+                totals_known_years.add(year)
+                completed_years.add(year)
+                year_rows = _update_year_row(
+                    year_rows,
+                    year,
+                    status="done",
+                    page=0,
+                    page_count=page_count,
+                    year_total_count=0,
+                    year_scanned=0,
+                    year_filled=0,
+                    pages=[],
+                    page_results=[],
+                    message="高级检索数量为 0，该年没有文件",
+                )
+                state.set_backfill_status(
+                    "ccdi",
+                    status="running",
+                    current=initial_dated + changed_total,
+                    total=total_ccdi,
+                    message=f"{year} 年检索数量为 0，已完成",
+                    extra={
+                        "year_total_count": 0,
+                        "year_rows": year_rows,
+                        "completed_years": sorted(completed_years, reverse=True),
+                    },
+                )
+                state.save_backfill_checkpoint(
+                    "ccdi",
+                    status="running",
+                    year=year,
+                    page=0,
+                    page_count=page_count,
+                    next_page=1,
+                    year_total_count=0,
+                    completed_years=sorted(completed_years, reverse=True),
+                    year_rows=year_rows,
+                )
+                continue
+            if not first_items:
+                year_complete = False
+                incomplete_years = _update_incomplete_year(
+                    incomplete_years,
+                    year=year,
+                    page=1,
+                    crawled=0,
+                    expected=0,
+                    year_total=year_total_count,
+                    complete=False,
+                )
+                state.set_backfill_status(
+                    "ccdi",
+                    status="error",
+                    current=initial_dated + changed_total,
+                    total=total_ccdi,
+                    message=f"{year} 年第一页没有解析到条目，无法计算该年总条数",
+                    extra={
+                        "incomplete_years": incomplete_years,
+                        "year_rows": year_rows,
+                    },
+                    persist=False,
+                )
+                queue_year_retry(year)
+                continue
+            if retrieval_total is not None:
+                year_total_count = retrieval_total
+                totals_known_years.add(year)
+                last_page_count = (
+                    retrieval_total
+                    if page_count <= 1
+                    else max(
+                        0,
+                        retrieval_total - (page_count - 1) * year_page_size,
+                    )
+                )
+            elif page_count <= 1:
+                year_total_count = _exact_result_count(
+                    page_count, year_page_size, len(first_items)
+                )
+                totals_known_years.add(year)
+                last_page_count = len(first_items)
+            else:
+                if not pause_page_access(f"读取 {year} 年末页"):
+                    aborted = True
+                    break
+                if not _goto_list_page_number(
+                    page,
+                    page_count,
+                    stop_event,
+                    force_page_one=True,
+                ):
+                    year_complete = False
+                    incomplete_years = _update_incomplete_year(
+                        incomplete_years,
+                        year=year,
+                        page=page_count,
+                        crawled=0,
+                        expected=0,
+                        year_total=year_total_count,
+                        complete=False,
+                    )
+                    state.set_backfill_status(
+                        "ccdi",
+                        status="error",
+                        current=initial_dated + changed_total,
+                        total=total_ccdi,
+                        message=f"{year} 年末页读取失败，无法精确计算该年总条数",
+                        extra={
+                            "incomplete_years": incomplete_years,
+                            "year_rows": year_rows,
+                        },
+                        persist=False,
+                    )
+                    queue_year_retry(year)
+                    continue
+                last_html = _read_list_html(page, stop_event) or ""
+                last_items = _parse_list_items(last_html) if last_html else []
+                if not last_items:
+                    year_complete = False
+                    incomplete_years = _update_incomplete_year(
+                        incomplete_years,
+                        year=year,
+                        page=page_count,
+                        crawled=0,
+                        expected=0,
+                        year_total=year_total_count,
+                        complete=False,
+                    )
+                    state.set_backfill_status(
+                        "ccdi",
+                        status="error",
+                        current=initial_dated + changed_total,
+                        total=total_ccdi,
+                        message=f"{year} 年末页没有解析到条目，无法精确计算总条数",
+                        extra={
+                            "incomplete_years": incomplete_years,
+                            "year_rows": year_rows,
+                        },
+                        persist=False,
+                    )
+                    queue_year_retry(year)
+                    continue
+                if not pause_page_access(f"{year} 年末页加载后停顿"):
+                    aborted = True
+                    break
+                year_total_count = _exact_result_count(
+                    page_count, year_page_size, len(last_items)
+                )
+                totals_known_years.add(year)
+                last_page_count = len(last_items)
+                if start_page > page_count:
+                    html = last_html
+                elif start_page == page_count:
+                    html = last_html
+                else:
+                    if not pause_page_access(f"恢复 {year} 年第 {start_page} 页"):
+                        aborted = True
+                        break
+                    if not _goto_list_page_number(
+                        page,
+                        start_page,
+                        stop_event,
+                        force_page_one=(start_page == 1),
+                    ):
+                        year_complete = False
+                        incomplete_years = _update_incomplete_year(
+                            incomplete_years,
+                            year=year,
+                            page=start_page,
+                            crawled=0,
+                            expected=0,
+                            year_total=year_total_count,
+                            complete=False,
+                        )
+                        state.save_backfill_checkpoint(
+                            "ccdi",
+                            status="running",
+                            current=initial_dated + changed_total,
+                            total=total_ccdi,
+                            message=f"{year} 年恢复到第 {start_page} 页失败",
+                            year=year,
+                            year_index=year_index,
+                            year_count=len(years),
+                            page=start_page,
+                            next_page=start_page,
+                            page_count=page_count,
+                            year_total_count=year_total_count,
+                            incomplete_years=incomplete_years,
+                        )
+                        queue_year_retry(year)
+                        continue
+                    html = _read_list_html(page, stop_event) or ""
+                    if not pause_page_access(
+                        f"{year} 年第 {start_page} 页加载后停顿"
+                    ):
+                        aborted = True
+                        break
+            local_keys = local_keys_by_year.get(year, set())
+            if (
+                not force_full
+                and not resumed_fields
+                and year_total_count is not None
+                and len(local_keys) == year_total_count
+            ):
+                matched_local_keys.update(local_keys)
+                skip_updates = {
+                    key: str(year)
+                    for key in local_keys
+                    if key in id_to_key
+                }
+                for key in skip_updates:
+                    id_to_key.pop(key, None)
+                if skip_updates:
+                    changed_total += state.set_document_publish_dates(
+                        skip_updates,
+                        precision="year",
+                        date_source="web",
+                        rebuild_index=rebuild_index_per_batch,
+                    )
+                year_scanned = year_total_count
+                year_filled = len(skip_updates)
+                completed_years.add(year)
+                incomplete_years = [
+                    item
+                    for item in incomplete_years
+                    if str(item.get("year")) != str(year)
+                ]
+                year_rows = _update_year_row(
+                    year_rows,
+                    year,
+                    status="done",
+                    page=page_count,
+                    page_count=page_count,
+                    year_total_count=year_total_count,
+                    year_scanned=year_scanned,
+                    year_filled=year_filled,
+                    pages=[],
+                    page_results=[],
+                    message=f"本地 {len(local_keys)} 条，通过",
+                )
+                state.set_backfill_status(
+                    "ccdi",
+                    status="running",
+                    current=initial_dated + changed_total,
+                    total=total_ccdi,
+                    message=f"{year} 年本地文件数一致，跳过逐页扫描",
+                    extra={
+                        "year": year,
+                        "year_index": year_index,
+                        "year_count": len(years),
+                        "year_total_count": year_total_count,
+                        "year_scanned": year_scanned,
+                        "year_filled": year_filled,
+                        "completed_years": sorted(completed_years, reverse=True),
+                        "incomplete_years": incomplete_years,
+                        "year_rows": year_rows,
+                    },
+                )
+                state.save_backfill_checkpoint(
+                    "ccdi",
+                    status="running",
+                    current=initial_dated + changed_total,
+                    total=total_ccdi,
+                    message=f"{year} 年本地文件数一致，已跳过",
+                    year=year,
+                    year_index=year_index,
+                    year_count=len(years),
+                    page=page_count,
+                    page_count=page_count,
+                    next_page=page_count + 1,
+                    year_total_count=year_total_count,
+                    year_scanned=year_scanned,
+                    year_filled=year_filled,
+                    completed_years=sorted(completed_years, reverse=True),
+                    incomplete_years=incomplete_years,
+                    year_rows=year_rows,
+                )
+                continue
+            loaded_page = start_page
+            for page_num in range(start_page, page_count + 1):
+                if stop_event and stop_event.is_set():
+                    break
+                wait_while_paused(pause_event, stop_event)
+                page_current = initial_dated + changed_total
+                page_message = (
+                    f"高级检索 {year} 年第 {page_num}/{page_count} 页"
+                    f"（年份 {year_index}/{len(years)}，已补 {page_current} 条）"
+                )
+                state.set_backfill_status(
+                    "ccdi",
+                    status="running",
+                    current=page_current,
+                    total=total_ccdi,
+                    message=page_message,
+                    extra={
+                        "year": year,
+                        "year_index": year_index,
+                        "year_count": len(years),
+                        "page": page_num,
+                        "page_count": page_count,
+                        "year_page_size": year_page_size,
+                        "year_total_count": year_total_count,
+                        "year_filled": year_filled,
+                        "next_page": page_num,
+                    },
+                    persist=False,
+                )
+                state.set_progress(
+                    "upload",
+                    status="running",
+                    current=page_current,
+                    total=total_ccdi,
+                    message=page_message,
+                    persist=False,
+                )
+                expected_count = (
+                    last_page_count
+                    if page_num == page_count
+                    else year_page_size
+                )
+                items: list[CcdiListItem] = []
+                page_complete = False
+                for attempt in range(1, 4):
+                    if attempt > 1 or page_num != loaded_page:
+                        if not pause_page_access(
+                            f"翻到 {year} 年第 {page_num} 页"
+                        ):
+                            aborted = True
+                            break
+                        if not _goto_list_page_number(
+                            page,
+                            page_num,
+                            stop_event,
+                            force_page_one=(page_num == 1),
+                        ):
+                            html = ""
+                        else:
+                            html = _read_list_html(page, stop_event) or ""
+                            if not pause_page_access(
+                                f"{year} 年第 {page_num} 页加载后停顿"
+                            ):
+                                aborted = True
+                                break
+                    if not html:
+                        page_message = (
+                            f"{year} 年第 {page_num}/{page_count} 页读取失败"
+                            f"（第 {attempt}/3 次）"
+                        )
+                    else:
+                        items = _parse_list_items(html)
+                        page_complete = len(items) >= expected_count
+                        page_message = (
+                            f"{year} 年第 {page_num}/{page_count} 页，"
+                            f"本页爬取 {len(items)}/{expected_count} 条"
+                        )
+                    state.set_backfill_status(
+                        "ccdi",
+                        status="running",
+                        current=initial_dated + changed_total + len(year_updates),
+                        total=total_ccdi,
+                        message=page_message,
+                        extra={
+                            "year": year,
+                            "year_index": year_index,
+                            "year_count": len(years),
+                            "page": page_num,
+                            "page_count": page_count,
+                            "year_page_size": year_page_size,
+                            "year_total_count": year_total_count,
+                            "year_filled": year_filled,
+                            "year_scanned": year_scanned,
+                            "page_crawled": len(items),
+                            "page_expected": expected_count,
+                            "page_complete": page_complete,
+                            "incomplete_years": incomplete_years,
+                            "year_rows": year_rows,
+                            "next_page": page_num,
+                        },
+                        persist=False,
+                    )
+                    if page_complete:
+                        break
+                    loaded_page = -1
+                if aborted:
+                    break
+                if not page_complete:
+                    year_complete = False
+                    incomplete_years = _update_incomplete_year(
+                        incomplete_years,
+                        year=year,
+                        page=page_num,
+                        crawled=len(items),
+                        expected=expected_count,
+                        year_total=year_total_count,
+                        complete=False,
+                    )
+                else:
+                    incomplete_years = _update_incomplete_year(
+                        incomplete_years,
+                        year=year,
+                        page=page_num,
+                        crawled=len(items),
+                        expected=expected_count,
+                        year_total=year_total_count,
+                        complete=True,
+                    )
+                page_counts[page_num] = max(
+                    page_counts.get(page_num, 0), len(items)
+                )
+                year_scanned = sum(page_counts.values())
+                if year_total_count is not None:
+                    year_scanned = min(year_scanned, year_total_count)
+                unresolved_pages = next(
+                    (
+                        item.get("pages", [])
+                        for item in incomplete_years
+                        if str(item.get("year")) == str(year)
+                    ),
+                    [],
+                )
+                year_rows = _update_year_row(
+                    year_rows,
+                    year,
+                    status="partial" if unresolved_pages else "running",
+                    page=page_num,
+                    page_count=page_count,
+                    year_total_count=year_total_count,
+                    year_scanned=year_scanned,
+                    year_filled=year_filled,
+                    pages=unresolved_pages,
+                    unmatched_web_ids=sorted(
+                        unmatched_web_by_year.get(year, set())
+                    ),
+                    message=(
+                        f"{len(unresolved_pages)} 个页面未爬完整"
+                        if unresolved_pages
+                        else (
+                            f"网页扫描 {year_scanned}/{year_total_count or '—'}；"
+                            f"本地新增/修正 {year_filled} 条"
+                        )
+                    ),
+                )
+                page_updates: dict[str, str] = {}
+                page_web_ids: list[int] = []
+                page_matched_local_ids: list[str] = []
+                page_matched_local_keys: list[str] = []
+                page_unmatched_web_ids: list[int] = []
+                for item in items:
+                    try:
+                        nid = int(str(item.doc_id).strip())
+                    except (TypeError, ValueError):
+                        continue
+                    page_web_ids.append(nid)
+                    doc_key = id_to_key.pop(nid, None)
+                    matched_key = doc_key or all_key_by_nid.get(nid)
+                    if not matched_key:
+                        page_unmatched_web_ids.append(nid)
+                        unmatched_web_by_year.setdefault(year, set()).add(nid)
+                        continue
+                    unmatched_web_by_year.setdefault(year, set()).discard(nid)
+                    page_matched_local_ids.append(str(nid))
+                    page_matched_local_keys.append(str(matched_key))
+                    matched_local_keys.add(matched_key)
+                    meta = document_meta_by_key.get(matched_key) or {}
+                    existing_year = parse_date_value(
+                        meta.get("publish_date")
+                    )[:4]
+                    if not existing_year or existing_year != str(year):
+                        year_updates[matched_key] = str(year)
+                        page_updates[matched_key] = str(year)
+                        year_filled += 1
+                        document_meta_by_key[matched_key] = {
+                            **meta,
+                            "publish_date": str(year),
+                        }
+                unmatched_current = sorted(
+                    unmatched_web_by_year.get(year, set())
+                )
+                year_rows = _update_year_row(
+                    year_rows,
+                    year,
+                    unmatched_web_ids=unmatched_current,
+                    message=(
+                        f"网页扫描 {year_scanned}/{year_total_count or '—'}；"
+                        f"本地新增/修正 {year_filled} 条；"
+                        f"未匹配网页编号 {len(unmatched_current)} 个"
+                    ),
+                )
+                year_rows = _update_page_result(
+                    year_rows,
+                    year,
+                    page_num,
+                    page_counts[page_num],
+                    expected_count,
+                    page_complete,
+                    web_ids=sorted(page_web_ids),
+                    matched_local_ids=sorted(page_matched_local_ids),
+                    matched_local_keys=sorted(page_matched_local_keys),
+                    unmatched_ids=sorted(page_unmatched_web_ids),
+                )
+                page_after_current = initial_dated + changed_total
+                if page_updates:
+                    changed_total += state.set_document_publish_dates(
+                        page_updates,
+                        precision="year",
+                        date_source="web",
+                        rebuild_index=rebuild_index_per_batch,
+                    )
+                state.set_backfill_status(
+                    "ccdi",
+                    status="running",
+                    current=page_after_current,
+                    total=total_ccdi,
+                    message=(
+                        f"{year} 年第 {page_num}/{page_count} 页，"
+                        f"该年共 {year_total_count or '—'} 条，"
+                        f"本年已补 {year_filled} 条"
+                    ),
+                    extra={
+                        "year": year,
+                        "year_index": year_index,
+                        "year_count": len(years),
+                        "page": page_num,
+                        "page_count": page_count,
+                        "year_page_size": year_page_size,
+                        "year_total_count": year_total_count,
+                        "year_filled": year_filled,
+                        "year_scanned": year_scanned,
+                        "page_crawled": len(items),
+                        "page_expected": expected_count,
+                        "page_complete": page_complete,
+                        "unmatched_web_ids": unmatched_current,
+                        "incomplete_years": incomplete_years,
+                        "year_rows": year_rows,
+                        "next_page": min(page_num + 1, page_count + 1),
+                    },
+                    persist=False,
+                )
+                state.save_backfill_checkpoint(
+                    "ccdi",
+                    status="running",
+                    current=page_after_current,
+                    total=total_ccdi,
+                    message=(
+                        f"{year} 年第 {page_num}/{page_count} 页，"
+                        f"该年共 {year_total_count or '—'} 条，"
+                        f"本年已补 {year_filled} 条"
+                    ),
+                    year=year,
+                    year_index=year_index,
+                    year_count=len(years),
+                    page=page_num,
+                    page_count=page_count,
+                    next_page=min(page_num + 1, page_count + 1),
+                    year_page_size=year_page_size,
+                    year_total_count=year_total_count,
+                    year_filled=year_filled,
+                    year_scanned=year_scanned,
+                    page_crawled=len(items),
+                    page_expected=expected_count,
+                    page_complete=page_complete,
+                    incomplete_years=incomplete_years,
+                    year_rows=year_rows,
+                )
+                if not id_to_key:
+                    break
+            if year_complete:
+                completed_years.add(year)
+            else:
+                queue_year_retry(year)
+            year_rows = _update_year_row(
+                year_rows,
+                year,
+                status=(
+                    "done"
+                    if year_complete
+                    else ("partial" if not year_complete else "done")
+                ),
+                page=page_count,
+                page_count=page_count,
+                year_total_count=year_total_count,
+                year_scanned=year_scanned,
+                year_filled=year_filled,
+                pages=next(
+                    (
+                        item.get("pages", [])
+                        for item in incomplete_years
+                        if str(item.get("year")) == str(year)
+                    ),
+                    [],
+                ),
+                message=(
+                    (
+                        f"网页总数 {year_total_count} 条；"
+                        f"本地新增/修正 {year_filled} 条"
+                        + (
+                            "；存在未爬完整页面"
+                            if any(
+                                str(item.get("year")) == str(year)
+                                for item in incomplete_years
+                            )
+                            else ""
+                        )
+                    )
+                    if year_complete
+                    else (
+                        f"总数已知 {year_total_count} 条；页面仍未补全"
+                        if year in totals_known_years
+                        else "尚未取得该年总数"
+                    )
+                ),
+            )
+            if year_updates:
+                logger.info(
+                    "中纪检历史日期补录：%s 年写入 %s 条，剩余 %s 条",
+                    year,
+                    len(year_updates),
+                    len(id_to_key),
+                )
+            state.set_backfill_status(
+                "ccdi",
+                status="running",
+                current=initial_dated + changed_total,
+                total=total_ccdi,
+                message=(
+                    f"{year} 年核对完成"
+                    + ("，已补齐该年全部待补条目" if not id_to_key else "")
+                ),
+                extra={
+                    "year": year,
+                    "year_index": year_index,
+                    "year_count": len(years),
+                    "year_total_count": year_total_count,
+                    "year_scanned": year_scanned,
+                    "completed_years": sorted(completed_years, reverse=True),
+                    "incomplete_years": incomplete_years,
+                    "year_rows": year_rows,
+                },
+            )
+            state.save_backfill_checkpoint(
+                "ccdi",
+                status="running",
+                current=initial_dated + changed_total,
+                total=total_ccdi,
+                message=f"{year} 年核对完成",
+                year=year,
+                year_index=year_index,
+                year_count=len(years),
+                page=page_count,
+                page_count=page_count,
+                next_page=page_count + 1,
+                year_page_size=year_page_size,
+                year_total_count=year_total_count,
+                year_filled=year_filled,
+                year_scanned=year_scanned,
+                incomplete_years=incomplete_years,
+                year_rows=year_rows,
+                completed_years=sorted(completed_years, reverse=True),
+            )
+    if not id_to_key:
+        for row in year_rows:
+            if str(row.get("status") or "") in {
+                "pending",
+                "error",
+                "partial",
+                "interrupted",
+            }:
+                row["status"] = "skipped_no_missing"
+                row["message"] = "该年没有待补日期的文件，无需扫描"
+        incomplete_years = []
+    match_audit = audit_ccdi_match_dates(state, repair=True)
+    changed_total += int(match_audit.get("repaired_count") or 0)
+    unmatched_local_keys = sorted(
+        set(all_key_by_nid.values()) - matched_local_keys
+    )
+    final_current = int(
+        match_audit.get("local_dated_count")
+        if match_audit.get("local_dated_count") is not None
+        else initial_dated + changed_total
+    )
+    all_years_completed = all(year in completed_years for year in years)
+    match_ok = bool(match_audit.get("consistent")) and (
+        not force_full or bool(match_audit.get("audit_complete"))
+    )
+    complete = (
+        all_years_completed
+        and match_ok
+        and not aborted
+        and not (stop_event and stop_event.is_set())
+    )
+    final_message = (
+        f"中纪检年份补全完成：{len(completed_years)}/{len(years)} 个年份"
+        if complete
+        else (
+            (
+                "中纪检年份总数已完成，但编号/日期一致性校验失败："
+                f"跨年重复 {match_audit['repeated_count']}、"
+                f"同年跨页重复 {match_audit['same_year_repeated_count']}、"
+                f"未匹配 {match_audit['unmatched_count']}、"
+                f"匹配但缺日期 {match_audit['matched_missing_date_count']}、"
+                f"日期年份不符 {match_audit['matched_wrong_year_count']}"
+            )
+            if all_years_completed
+            else (
+                f"中纪检年份补录中止：已完成 "
+                f"{len(completed_years)}/{len(years)} 个年份，"
+                f"未完成年份 "
+                f"{len([y for y in years if y not in completed_years])} 个"
+            )
+        )
+    )
+    state.set_backfill_status(
+        "ccdi",
+        status="done" if complete else "error",
+        current=final_current,
+        total=total_ccdi,
+        message=final_message,
+        extra={
+            "missing": len(id_to_key),
+            "unmatched_local_count": len(unmatched_local_keys),
+            "unmatched_local_ids": unmatched_local_keys[:200],
+            "force_full": False,
+            "year_table_version": 2,
+            "incomplete_years": incomplete_years,
+            "year_rows": year_rows,
+            "match_audit": match_audit,
+            "completed_years": (
+                [] if complete else sorted(completed_years, reverse=True)
+            ),
+        },
+    )
+    state.set_progress(
+        "upload",
+        status="idle",
+        current=final_current,
+        total=total_ccdi,
+        message=final_message,
+    )
+    if complete:
+        state.clear_backfill_checkpoint("ccdi")
+    else:
+        state.save_backfill_checkpoint(
+            "ccdi",
+            status="error",
+            current=final_current,
+            total=total_ccdi,
+            message=final_message,
+            year_rows=year_rows,
+            incomplete_years=incomplete_years,
+            completed_years=sorted(completed_years, reverse=True),
+            match_audit=match_audit,
+            unmatched_local_count=len(unmatched_local_keys),
+            unmatched_local_ids=unmatched_local_keys[:200],
+        )
+    return changed_total
+
+
 def crawl_ccdi_by_id(
     output_dir: Path,
     state: CrawlerState,
@@ -2124,6 +3796,7 @@ def crawl_ccdi_by_id(
     stealth: bool = True,
     user_agents: list[str] | None = None,
     first_run: bool = False,
+    publish_year_hint: int | None = None,
     retry_ids: list[int] | None = None,
     retry_probe=None,
     throttle_wait_ranges: list | None = None,
@@ -2265,6 +3938,7 @@ def crawl_ccdi_by_id(
     done = base
     scanned = 0
     loaded = 0
+    detected_year_hint = publish_year_hint
     aborted = False
     throttle_blocked = False
     last_id = last_done_id
@@ -2450,6 +4124,8 @@ def crawl_ccdi_by_id(
                 stop_event,
                 pause_event,
             )
+            if new_ids and listing_status == "ok":
+                detected_year_hint = datetime.now().year
             if not new_ids and listing_status in ("failed", "captcha"):
                 # 3) 检索不可用（常见：滑动验证）→ 退回「全部数据」目录页扫描
                 logger.info("高级检索不可用，改用「全部数据」目录页检查")
@@ -3000,9 +4676,18 @@ def crawl_ccdi_by_id(
             else:
                 folder = root / main_cat
                 prefix = f"[{seq}] "
+            html_for_date = html or ""
+            if detected_year_hint:
+                # 日常维护的新条目来自按年份高级检索，只记录年份，不额外解析具体日期。
+                publish_date = str(detected_year_hint)
+            else:
+                extracted_date = _extract_ccdi_publish_date(html_for_date)
+                publish_date = extracted_date[:4] if extracted_date else ""
             # 文件名按 UTF-8 字节截断：Linux 单个文件名上限 255 字节，
             # 中文标题一长就会 OSError: File name too long（旧版本会整轮崩掉）。
-            candidate = folder / fit_filename(prefix, sanitize_filename(title))
+            candidate = folder / fit_filename(
+                prefix, sanitize_filename(title)
+            )
             try:
                 if candidate.exists():
                     candidate = ensure_unique_path(candidate)
@@ -3054,6 +4739,9 @@ def crawl_ccdi_by_id(
                 url=url,
                 pdf_path=str(candidate.resolve()),
                 category_path=cat_path,
+                publish_date=publish_date,
+                date_precision="year" if publish_date else "",
+                link_suffix=str(nid),
             )
             if registered:
                 per_cat[cat_path] = seq
@@ -3063,6 +4751,11 @@ def crawl_ccdi_by_id(
             else:
                 # 已登记但旧 PDF 不在了：这次重新导出的文件接管记录
                 state.repoint_document(key, str(candidate.resolve()))
+                state.set_document_publish_date(
+                    key,
+                    publish_date,
+                    precision="year" if publish_date else "",
+                )
                 known_ok[key] = candidate
             scanned += 1
             note_position(nid, valid=True)

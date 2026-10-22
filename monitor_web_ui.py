@@ -170,6 +170,110 @@ HTML_TEMPLATE = """
     .mini-btn { padding: 3px 10px; border: 1px solid #fecaca; border-radius: 999px;
       background: #fff1f2; color: #b91c1c; font-size: 12px; cursor: pointer; }
     .mini-btn:hover:not(:disabled) { background: #ffe4e6; }
+    .agent-overview { display: grid; grid-template-columns: minmax(310px, .82fr) minmax(520px, 1.55fr); gap: 18px; align-items: stretch; }
+    .agent-libs { display: flex; flex-direction: column; gap: 18px; min-height: 100%; }
+    .agent-libs > .card { flex: 1 1 0; margin-bottom: 0; display: flex; flex-direction: column; justify-content: flex-start; padding-top: 18px; }
+    .agent-task-card { display: flex; flex-direction: column; height: 100%; }
+    .agent-dataset-card { text-align: center; min-width: 0; padding-left: 14px; padding-right: 14px; background: linear-gradient(180deg, #f7fbff 0%, #edf5ff 100%); border-color: #d9e8f8; }
+    .agent-dataset-card .stat-row { justify-content: center; }
+    .agent-dataset-card .lib-title { text-align: center; }
+    .lib-id { margin-top: 7px; padding: 7px 2px; text-align: center; white-space: nowrap; font-family: Consolas, "Courier New", monospace; font-size: 10.8px; line-height: 1.45; color: #475569; background: #f8fafc; border: 1px solid #eef2f7; border-radius: 7px; overflow: hidden; }
+    .task-id-list { display: flex; flex-wrap: wrap; gap: 5px; max-height: 156px; overflow: auto; margin-top: 8px; }
+    .retry-box { border: 1px solid #fecaca; border-radius: 8px; background: #fff7f7; margin-top: 9px; overflow: hidden; }
+    .retry-box > summary { cursor: pointer; list-style: none; padding: 6px 8px; color: #b91c1c; font-size: 12px; font-weight: 600; }
+    .retry-box > summary::-webkit-details-marker { display: none; }
+    .retry-box > summary::before { content: "▸"; display: inline-block; margin-right: 5px; color: #ef4444; }
+    .retry-box[open] > summary::before { transform: rotate(90deg); }
+    .retry-box .task-id-list { padding: 0 7px 7px; margin-top: 0; max-height: 130px; }
+    .backfill-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 12px 0; }
+    .backfill-mini { border: 1px solid #dfe6f0; border-radius: 11px; padding: 12px; background: linear-gradient(180deg, #fff 0%, #f8fafc 100%); min-width: 0; box-shadow: 0 2px 8px rgba(15,23,42,.04); }
+    .backfill-mini .bf-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 9px; }
+    .backfill-mini .bf-title { font-size: 14px; font-weight: 700; color: #1e293b; }
+    .bf-section { min-width: 0; }
+    .bf-section-title { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; }
+    .bf-section-title .tag { font-weight: 600; }
+    .bf-divider { height: 1px; background: linear-gradient(90deg, transparent, #d8e0eb 12%, #d8e0eb 88%, transparent); margin: 12px 0; }
+    .bf-num-line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin: 5px 0; }
+    .backfill-mini .bf-num { font-size: 19px; font-weight: 750; color: #111827; }
+    .backfill-mini .bf-msg { font-size: 11px; color: #64748b; margin-top: 5px; line-height: 1.45; word-break: break-word; }
+    .backfill-mini .bar { height: 6px; margin-top: 6px; }
+    .bf-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+    .bf-tags .tag { font-size: 10.5px; padding: 2px 7px; background: #eef4fb; color: #31547a; border: 1px solid #dae7f5; }
+    .bf-error { margin-top: 8px; padding: 6px 8px; border-radius: 7px; background: #fff1f2; border: 1px solid #fecdd3; color: #b91c1c; font-size: 11px; text-align: left; word-break: break-word; }
+    .year-panel { margin-top: 12px; border-top: 1px solid #e5eaf2; padding-top: 11px; }
+    .year-panel > summary { cursor: pointer; list-style: none; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: #1e293b; font-weight: 600; }
+    .year-panel > summary::-webkit-details-marker { display: none; }
+    .year-panel > summary::before { content: "▸"; color: #94a3b8; display: inline-block; }
+    .year-panel[open] > summary::before { transform: rotate(90deg); }
+    .year-table-wrap { max-height: 340px; overflow: auto; margin-top: 9px; border: 1px solid #e5eaf2; border-radius: 8px; }
+    .year-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+    .year-table th { position: sticky; top: 0; background: #f8fafc; color: #64748b; padding: 7px 8px; text-align: left; z-index: 1; }
+    .year-table td { padding: 6px 8px; border-top: 1px solid #eef2f7; vertical-align: top; }
+    .year-table .year-column-col { width: 92px; }
+    .year-table .year-column { white-space: nowrap; }
+    .year-table .page-position-col { width: 124px; }
+    .year-table .page-position { white-space: nowrap; }
+    .year-table .year-description { min-width: 310px; line-height: 1.65; }
+    .year-table .year-description .bf-tags { margin-top: 0; }
+    .year-table tr.current td { background: #eff6ff; }
+    .year-table tr.current td:first-child { box-shadow: inset 3px 0 0 #3b82f6; }
+    .year-table tr.year-main-row { cursor: pointer; }
+    .year-table tr.year-main-row:hover td { background: #f8fbff; }
+    .year-table tr.year-page-detail td { background: #f8fafc; padding: 8px 12px; }
+    .year-page-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    .year-page-table th, .year-page-table td { padding: 4px 7px; border-bottom: 1px solid #edf1f6; text-align: left; }
+    .year-page-table th { color: #64748b; font-weight: 600; background: transparent; position: static; }
+    .year-page-table .page-index { padding-left: 24px; width: 140px; white-space: nowrap; }
+    .year-page-table .page-counts { width: 112px; white-space: nowrap; }
+    .year-page-table .page-status { width: 96px; white-space: nowrap; }
+    .year-page-table .page-ids { min-width: 360px; }
+    .page-id-details > summary { cursor: pointer; color: #2563eb; font-size: 11px; list-style: none; display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
+    .page-id-details > summary::-webkit-details-marker { display: none; }
+    .page-id-details > summary::before { content: "▸"; display: inline-block; margin-right: 4px; }
+    .page-id-details[open] > summary::before { transform: rotate(90deg); }
+    .page-id-details .tag, .year-table .inline-num { padding: 1px 6px; font-size: 10.5px; }
+    .page-id-box { margin-top: 6px; padding: 6px 8px; border-radius: 7px; border: 1px solid; line-height: 2; }
+    .page-id-box.web { background: #eff6ff; border-color: #bfdbfe; }
+    .page-id-box.local { background: #ecfdf5; border-color: #bbf7d0; }
+    .page-id-box .box-label { display: inline-block; margin-right: 6px; font-weight: 600; font-size: 10.5px; }
+    .page-id-box.web .box-label { color: #1d4ed8; }
+    .page-id-box.local .box-label { color: #15803d; }
+    .id-chip { display: inline-block; margin: 2px 4px 2px 0; padding: 1px 6px; border-radius: 5px; border: 1px solid; font-size: 10.5px; line-height: 1.45; }
+    .id-chip.web { color: #1e40af; background: #dbeafe; border-color: #93c5fd; }
+    .id-chip.local { color: #166534; background: #dcfce7; border-color: #86efac; }
+    .id-chip.unmatched { color: #991b1b; background: #fee2e2; border-color: #f87171; font-weight: 700; }
+    .year-progress-mini { height: 4px; background: #e8ecf4; border-radius: 999px; overflow: hidden; margin-top: 4px; min-width: 72px; }
+    .year-progress-mini > span { display: block; height: 100%; background: linear-gradient(90deg, #60a5fa, #2563eb); }
+    @media (max-width: 640px) { .backfill-grid { grid-template-columns: 1fr; } }
+    .version-families { margin-top: 4px; }
+    .section-toggle { border: none; background: transparent; color: #64748b; cursor: pointer; font-size: 12px; padding: 2px 5px; }
+    .version-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; margin: 10px 0; }
+    .version-controls input[type="search"] { flex: 1 1 260px; min-width: 180px; padding: 7px 9px; border: 1px solid #d5dbe5; border-radius: 8px; }
+    .version-controls select { padding: 5px 7px; border: 1px solid #d5dbe5; border-radius: 6px; background: #fff; }
+    .version-pager { display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+    .version-pager button { padding: 5px 10px; border: 1px solid #d5dbe5; border-radius: 7px; background: #fff; cursor: pointer; }
+    .version-pager button.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+    .version-pager input { width: 54px; padding: 5px 7px; border: 1px solid #d5dbe5; border-radius: 6px; text-align: center; }
+    .version-family { border: 1px solid #e5eaf2; border-radius: 9px; margin-top: 8px; background: #fbfcfe; }
+    .version-family > summary { cursor: pointer; padding: 9px 11px; list-style: none; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .version-family > summary::-webkit-details-marker { display: none; }
+    .version-family > summary::before { content: "▸"; color: #94a3b8; }
+    .version-family[open] > summary::before { transform: rotate(90deg); }
+    .version-row { display: grid; grid-template-columns: minmax(130px, 160px) minmax(220px, 1.25fr) minmax(180px, 1fr) 112px; gap: 12px; padding: 8px 11px; border-top: 1px solid #eef1f6; align-items: start; font-size: 12px; }
+    .version-row > div { min-width: 0; overflow-wrap: anywhere; }
+    .version-row .tag { max-width: 100%; white-space: normal; word-break: break-all; }
+    .version-row.latest { background: #f0fdf4; }
+    .version-row.version-head { background: #f8fafc; color: #64748b; font-weight: 600; font-size: 11px; }
+    .badge-latest { background: #dcfce7; color: #15803d; border: 1px solid #bbf7d0; }
+    .dialog-mask { position: fixed; inset: 0; background: rgba(15,23,42,.48); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 50; }
+    .dialog-mask.open { display: flex; }
+    .dialog-box { width: min(560px, 100%); background: #fff; border-radius: 14px; padding: 22px; box-shadow: 0 24px 60px rgba(15,23,42,.25); }
+    .dialog-box h3 { margin: 0 0 10px; color: #991b1b; }
+    .dialog-box p { margin: 8px 0; color: #475569; line-height: 1.7; }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+    .dialog-actions button { padding: 8px 16px; border-radius: 8px; border: 1px solid #d5dbe5; background: #fff; cursor: pointer; }
+    .dialog-actions .danger { color: #fff; background: #dc2626; border-color: #dc2626; }
+    @media (max-width: 900px) { .agent-overview { grid-template-columns: 1fr; } .version-row { grid-template-columns: 64px 1fr; } }
     /* 中纪检：子分类进度 + 右侧两张卡片，等高排列 */
     .ccdi-bottom { display: flex; gap: 16px; align-items: stretch; margin-bottom: 18px; }
     .ccdi-cat-col { flex: 1 1 auto; min-width: 0; display: flex; }
@@ -279,6 +383,8 @@ HTML_TEMPLATE = """
     .idle { background: #e5e7eb; color: #374151; }
     .error { background: #fee2e2; color: #b91c1c; }
     .progress-card.is-error { border-color: #fca5a5; box-shadow: 0 0 0 3px rgba(239,68,68,.08); }
+    .progress-card.progress-ccdi { background: linear-gradient(180deg, #f5f9ff 0%, #eaf3ff 100%); border-color: #d6e7fb; }
+    .progress-card.progress-bit { background: linear-gradient(180deg, #f9f7ff 0%, #f0ebff 100%); border-color: #e3dafb; }
     .controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
     .controls label { font-size: 13px; color: #444; display: flex; flex-direction: column; gap: 4px; }
     .controls select, .controls input { padding: 7px 9px; border: 1px solid #d5dbe5; border-radius: 8px; font-size: 13px; background: #fff; color: #1f2937; }
@@ -478,10 +584,14 @@ HTML_TEMPLATE = """
       </label>
       <button id="agent_save_btn" onclick="saveAgentConfig()">保存配置</button>
       <button id="agent_refresh_btn" onclick="refreshAgentStatus()">手动刷新</button>
+      <button id="agent_migrate_btn" onclick="openMigrationDialog()" style="background:#b91c1c;color:#fff">迁库</button>
     </div>
     <div id="agent_msg" class="hint" style="display:none;color:#16a34a;margin-top:10px"></div>
     <div id="agent_error" class="hint" style="display:none;color:#dc2626;margin-top:10px"></div>
-    <div class="grid" id="agent_datasets" style="margin-top:14px"></div>
+    <div class="agent-overview" style="margin-top:14px">
+      <div id="agent_datasets" class="agent-libs"></div>
+      <div class="card agent-task-card" id="agent_task_card"></div>
+    </div>
   </div>
 
   <div class="grid" id="summary"></div>
@@ -532,6 +642,53 @@ HTML_TEMPLATE = """
     </table>
   </div>
 
+  <div class="card" id="versions_card">
+    <div class="card-head">
+      <h2><button id="version_toggle_btn" class="section-toggle" onclick="toggleVersionsCard()" title="展开/收起">▼</button> 多版本文档</h2>
+      <span class="muted">仅最新版本会进入学科智能体</span>
+    </div>
+    <div id="version_card_body">
+      <div class="version-controls">
+        <input id="version_search" type="search" placeholder="搜索标题、链接后缀或位置" oninput="changeVersionSearch(this.value)" />
+        <div class="tab-group" id="version_source_tabs">
+          <button type="button" class="tab active" data-source="all" onclick="setVersionSource('all')">全部</button>
+          <button type="button" class="tab" data-source="ccdi" onclick="setVersionSource('ccdi')">中纪检</button>
+          <button type="button" class="tab" data-source="bit" onclick="setVersionSource('bit')">校纪检</button>
+        </div>
+        <label class="muted">每页
+          <select id="version_page_size" onchange="changeVersionPageSize(this.value)">
+            <option value="5">5</option>
+            <option value="10" selected>10</option>
+            <option value="20">20</option>
+            <option value="50">50</option>
+          </select>
+        </label>
+      </div>
+      <div id="version_families" class="version-families"></div>
+      <div class="version-pager">
+        <button onclick="setVersionPage(versionPage - 1)">上一页</button>
+        <span id="version_pager"></span>
+        <button onclick="setVersionPage(versionPage + 1)">下一页</button>
+        <span class="muted">跳至</span>
+        <input id="version_jump" type="number" min="1" value="1" onchange="jumpVersionPage(this.value)" />
+        <span class="muted">页</span>
+        <span id="version_page_info" class="muted">—</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="dialog-mask" id="migration_dialog" role="dialog" aria-modal="true" aria-labelledby="migration_title">
+    <div class="dialog-box">
+      <h3 id="migration_title">确认迁移学科智能体知识库？</h3>
+      <p>此操作会删除当前的「中纪检」和「校纪检」知识库，然后创建同名新库，并把本地每个标题族的最新版本重新上传。</p>
+      <p>迁库前会尽量补录历史发布日期；旧库数据删除后无法通过本程序恢复。任务执行期间不能爬取或上传。</p>
+      <div class="dialog-actions">
+        <button type="button" onclick="closeMigrationDialog()">取消</button>
+        <button type="button" class="danger" id="migration_confirm_btn" onclick="confirmMigration()">再次确认并迁库</button>
+      </div>
+    </div>
+  </div>
+
 <script>
 async function api(url, options) {
   const res = await fetch(url, options);
@@ -566,6 +723,15 @@ let filesPages = 1;
 let uploadHideTimer = null;
 let uploadSessionActive = false;
 let lastUploadSig = null;
+let uiYearPanelOpen = true;
+const expandedYears = new Set();
+const expandedPageDetails = new Set();
+let allVersionFamilies = [];
+let versionPage = 1;
+let versionPageSize = 10;
+let versionSource = 'all';
+let versionQuery = '';
+let versionCardOpen = true;
 
 function applyVisual() {
   const auto = (uiUpload === 'auto');
@@ -647,7 +813,9 @@ function applySettings(s) {
   }
   if (s.config_info) renderConfigInfo(s.config_info);
   applyVisual();
-  uiRunning = !!(s.crawl_running || s.upload_running);
+  uiRunning = !!(
+    s.crawl_running || s.upload_running || s.migration_running || s.index_building
+  );
   uiPaused = !!s.paused;
   const toggleBtn = document.getElementById('top_btn_toggle');
   toggleBtn.textContent = (uiRunning && !uiPaused) ? '⏸' : '▶';
@@ -656,8 +824,12 @@ function applySettings(s) {
   // 状态文件里还有来源显示「运行中」时，停止按钮必须可用，
   // 否则会出现「进度卡片在爬、顶部停止却是灰的」。
   const busy = uiRunning || uiStateBusy;
+  const indexReady = s.index_ready !== false;
+  toggleBtn.disabled = false;
   document.getElementById('top_btn_stop').disabled = !busy;
-  document.getElementById('top_btn_upload').disabled = busy;
+  document.getElementById('top_btn_upload').disabled = busy || !indexReady;
+  const migrateBtn = document.getElementById('agent_migrate_btn');
+  if (migrateBtn) migrateBtn.disabled = busy;
   document.getElementById('top_btn_output_dir').disabled = uiRunning;
   document.getElementById('top_output_dir').disabled = uiRunning;
   document.getElementById('top_state').textContent =
@@ -969,6 +1141,37 @@ function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+function tagNumbers(text) {
+  const value = String(text ?? '');
+  const pattern = /\\d+(?:\\s*\\/\\s*\\d+)?/g;
+  let html = '';
+  let last = 0;
+  let match;
+  while ((match = pattern.exec(value)) !== null) {
+    html += esc(value.slice(last, match.index));
+    html += '<span class="tag inline-num">' + esc(match[0]) + '</span>';
+    last = match.index + match[0].length;
+  }
+  return html + esc(value.slice(last));
+}
+
+function rememberPageDetail(details) {
+  const key = details.dataset.detailKey || '';
+  if (!key) return;
+  if (details.open) expandedPageDetails.add(key);
+  else expandedPageDetails.delete(key);
+}
+
+function pageIdChips(ids, cls, unmatchedIds) {
+  const values = (ids || []).map(String);
+  if (!values.length) return '<span class="muted">—</span>';
+  return values.map(id => {
+    const missing = unmatchedIds && unmatchedIds.has(id);
+    return '<span class="id-chip ' + cls + (missing ? ' unmatched' : '') + '">'
+      + esc(id) + '</span>';
+  }).join('');
+}
+
 function renderAgentStatus(data) {
   agentFullApiKey = data.api_key || '';
   agentMaskedApiKey = data.api_key_masked || '';
@@ -980,32 +1183,394 @@ function renderAgentStatus(data) {
 
   const errEl = document.getElementById('agent_error');
   const dsEl = document.getElementById('agent_datasets');
+  renderAgentTaskCard(data.upload_state || {}, data.parse_settings || {});
   if (!data.ok) {
     errEl.textContent = '连接失败：' + (data.error || '未知错误');
     errEl.style.display = 'block';
-    dsEl.innerHTML = '';
+    renderAgentRetryBoxes(data.upload_state || {});
     return;
   }
   errEl.style.display = 'none';
   dsEl.innerHTML = (data.datasets || []).map(ds => {
+    const source = ds.name === '中纪检' ? 'ccdi' : (ds.name === '校纪检' ? 'bit' : '');
     if (!ds.found) {
-      return '<div class="card"><div class="lib-title">' + esc(ds.name) + '</div>'
-        + '<div class="muted">未找到对应知识库</div></div>';
+      return '<div class="card agent-dataset-card"><div class="lib-title">' + esc(ds.name) + '</div>'
+        + '<div class="muted">未找到对应知识库</div>'
+        + (source ? '<div id="agent_retry_' + source + '"></div>' : '')
+        + '</div>';
     }
     const extra = (ds.counted !== undefined && ds.total !== ds.counted)
       ? ' <span class="muted">（状态统计 ' + ds.counted + '）</span>' : '';
-    return '<div class="card">'
+    return '<div class="card agent-dataset-card">'
       + '<div class="lib-title">' + esc(ds.name) + '</div>'
       + '<div class="stat">' + ds.total + '</div>'
       + '<div class="muted">文件总数' + extra + '</div>'
-      + '<div class="muted" style="margin-top:6px">库ID：' + esc(ds.dataset_id) + '</div>'
+      + '<div class="lib-id">库ID：' + esc(ds.dataset_id) + '</div>'
       + '<div class="stat-row">'
       + '<span class="pill done">已完成 ' + ds.done + '</span>'
       + '<span class="pill running">解析中 ' + ds.running + '</span>'
       + '<span class="pill pending">上传中 ' + ds.pending + '</span>'
       + '<span class="pill failed">失败 ' + ds.failed + '</span>'
-      + '</div></div>';
+      + '</div>'
+      + (source ? '<div id="agent_retry_' + source + '"></div>' : '')
+      + '</div>';
   }).join('') || '<div class="muted">暂无数据</div>';
+  renderAgentRetryBoxes(data.upload_state || {});
+}
+
+function toggleYearRow(row) {
+  const year = row.getAttribute('data-year');
+  const detail = row.nextElementSibling;
+  if (!detail || !detail.classList.contains('year-page-detail')) return;
+  const open = detail.style.display === 'none';
+  detail.style.display = open ? 'table-row' : 'none';
+  if (open) expandedYears.add(year); else expandedYears.delete(year);
+  const arrow = row.querySelector('.year-arrow');
+  if (arrow) arrow.textContent = open ? '▾' : '▸';
+}
+
+function yearProgressPanel(state) {
+  const rows = (state.year_rows || []).slice().sort((a, b) =>
+    (parseInt(b.year, 10) || 0) - (parseInt(a.year, 10) || 0)
+  );
+  if (!rows.length) return '';
+  const statusText = {
+    pending: '待扫描',
+    running: '补录中',
+    done: '完成',
+    partial: '部分完成',
+    error: '异常',
+    interrupted: '已中断',
+    skipped_no_missing: '无需补录'
+  };
+  const doneCount = rows.filter(row => row.status === 'done' || row.status === 'skipped_no_missing').length;
+  const currentYear = String(state.year || '');
+  const webYearsById = new Map();
+  const webYearOccurrences = new Map();
+  const unmatchedWebIds = new Set();
+  rows.forEach(row => {
+    const year = String(row.year || '');
+    (row.page_results || []).forEach(page => {
+      (page.web_ids || []).forEach(id => {
+        const key = String(id);
+        if (!webYearsById.has(key)) webYearsById.set(key, new Set());
+        webYearsById.get(key).add(year);
+        const occurrenceKey = year + ':' + key;
+        webYearOccurrences.set(
+          occurrenceKey,
+          (webYearOccurrences.get(occurrenceKey) || 0) + 1
+        );
+      });
+      (page.unmatched_ids || []).forEach(id => unmatchedWebIds.add(String(id)));
+    });
+    (row.unmatched_web_ids || []).forEach(id => unmatchedWebIds.add(String(id)));
+  });
+  const repeatedWebIds = [...webYearsById.entries()]
+    .filter(([, years]) => years.size > 1)
+    .map(([id]) => id);
+  const sameYearRepeatedIds = [...webYearOccurrences.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([key]) => key.split(':').slice(1).join(':'));
+  let html = '<details class="year-panel"'
+    + (uiYearPanelOpen ? ' open' : '')
+    + ' ontoggle="uiYearPanelOpen=this.open">'
+    + '<summary><span>中纪检 · 年份日期补全进度</span>'
+    + '<span class="muted">完成 ' + doneCount + '/' + rows.length + '</span>'
+    + (currentYear ? '<span class="tag running">当前 ' + esc(currentYear) + ' 年</span>' : '')
+    + '<span class="tag ' + (repeatedWebIds.length ? 'tag-failed' : 'tag-yes') + '">'
+    + '跨年重复' + repeatedWebIds.length + '项</span>'
+    + '<span class="tag ' + (sameYearRepeatedIds.length ? 'tag-failed' : 'tag-yes') + '">'
+    + '同年重复' + sameYearRepeatedIds.length + '项</span>'
+    + '<span class="tag ' + (unmatchedWebIds.size ? 'tag-failed' : 'tag-yes') + '">'
+    + '未匹配' + unmatchedWebIds.size + '项</span>'
+    + '</summary>'
+    + '<div class="year-table-wrap"><table class="year-table"><colgroup>'
+    + '<col class="year-column-col"><col style="width:130px"><col class="page-position-col">'
+    + '<col style="width:92px"><col></colgroup><thead><tr>'
+    + '<th class="year-column">年份</th><th>已扫描 / 共</th>'
+    + '<th class="page-position">当前页 / 总页数</th><th>状态</th>'
+    + '<th>说明</th></tr></thead><tbody>';
+  rows.forEach(row => {
+    const total = Number(row.year_total_count || 0);
+    const scanned = Number(row.year_scanned || 0);
+    const pct = total > 0 ? Math.min(100, Math.round(100 * scanned / total)) : 0;
+    const status = row.status || 'pending';
+    const safeStatus = ['pending','running','done','partial','interrupted'].includes(status)
+      ? status : (status === 'skipped_no_missing' ? 'done' : 'skipped');
+    const pages = (row.pages || []).map(p =>
+      '第' + p.page + '页 ' + (p.crawled || 0) + '/' + (p.expected || 0)
+    ).join('、');
+    const reason = pages || row.message || '';
+    const pageResults = row.page_results || (row.pages || []).map(p => ({
+      page: p.page,
+      crawled: p.crawled,
+      expected: p.expected,
+      complete: false
+    }));
+    const pageTableRows = pageResults.length
+      ? pageResults.map(page => {
+          const webIds = page.web_ids || [];
+          const localIds = page.matched_local_ids || [];
+          const missingIds = page.unmatched_ids || [];
+          const detailKey = String(row.year) + ':' + String(page.page);
+          const missingSet = new Set(missingIds.map(String));
+          return '<tr><td class="page-index">第 <span class="tag inline-num">'
+            + esc(page.page) + '</span> 页</td>'
+            + '<td class="page-counts">' + esc(page.crawled || 0)
+            + ' / ' + esc(page.expected || 0) + '</td>'
+            + '<td class="page-status"><span class="tag ' + (page.complete ? 'tag-yes' : 'tag-failed') + '">'
+            + (page.complete ? '完成' : '未完成') + '</span></td>'
+            + '<td class="page-ids"><details class="page-id-details"'
+            + ' data-detail-key="' + esc(detailKey) + '"'
+            + (expandedPageDetails.has(detailKey) ? ' open' : '')
+            + ' ontoggle="rememberPageDetail(this)">'
+            + '<summary title="展开或收起编号明细">'
+            + '<span>网页 <span class="tag tag-src-ccdi">' + webIds.length + '</span></span>'
+            + '<span>匹配 <span class="tag tag-yes">' + localIds.length + '</span></span>'
+            + '<span>未匹配 <span class="tag ' + (missingIds.length ? 'tag-failed' : 'tag-yes') + '">'
+            + missingIds.length + '</span></span></summary>'
+            + '<div class="page-id-box web"><span class="box-label">网页编号</span>'
+            + pageIdChips(webIds, 'web', missingSet) + '</div>'
+            + '<div class="page-id-box local"><span class="box-label">本地对应编号</span>'
+            + pageIdChips(localIds.map(id => 'ccdi:' + id), 'local', null) + '</div>'
+            + '</details></td></tr>';
+        }).join('')
+      : '<tr><td colspan="4" class="muted">尚未读取页面明细</td></tr>';
+    const unmatchedWeb = (row.unmatched_web_ids || []);
+    const yearWebIds = new Set(pageResults.flatMap(p => (p.web_ids || []).map(String)));
+    const yearLocalIds = new Set(pageResults.flatMap(p => (p.matched_local_ids || []).map(String)));
+    const yearUnmatchedIds = new Set([
+      ...pageResults.flatMap(p => (p.unmatched_ids || []).map(String)),
+      ...unmatchedWeb.map(String)
+    ]);
+    const webIdTotal = yearWebIds.size;
+    const localIdTotal = yearLocalIds.size;
+    const unmatchedIdTotal = yearUnmatchedIds.size;
+    const matchSummary = '<div class="bf-tags" style="margin-top:7px">'
+      + '<span class="tag">网页编号 ' + webIdTotal + '</span>'
+      + '<span class="tag tag-yes">本地匹配 ' + localIdTotal + '</span>'
+      + '<span class="tag ' + (unmatchedIdTotal ? 'tag-failed' : 'tag-yes') + '">未匹配 '
+      + unmatchedIdTotal + '</span>'
+      + '<span class="tag ' + (unmatchedIdTotal ? 'tag-failed' : 'tag-yes') + '">'
+      + (unmatchedIdTotal ? '未全部匹配' : '全部匹配') + '</span></div>';
+    const unmatchedHtml = unmatchedWeb.length
+      ? '<div class="bf-tags" style="margin-top:7px"><span class="tag tag-failed">未匹配网页编号 '
+        + unmatchedWeb.length + '</span>'
+        + unmatchedWeb.map(id => '<span class="tag tag-failed">' + esc(id) + '</span>').join('')
+        + '</div>'
+      : '';
+    const descriptionTags = '<div class="bf-tags">'
+      + '<span class="tag ' + (unmatchedIdTotal ? 'tag-failed' : 'tag-yes') + '">'
+      + '未匹配' + unmatchedIdTotal + '项</span></div>';
+    const descriptionHtml = reason
+      ? '<div class="muted" style="margin-top:5px">' + tagNumbers(reason) + '</div>'
+      : '';
+    html += '<tr class="year-main-row ' + (String(row.year) === currentYear ? 'current' : '')
+      + '" data-year="' + esc(row.year) + '" onclick="toggleYearRow(this)">'
+      + '<td class="year-column"><span class="year-arrow">'
+      + (expandedYears.has(String(row.year)) ? '▾' : '▸')
+      + '</span> <b>' + esc(row.year) + '</b></td>'
+      + '<td class="num">' + scanned + ' / ' + (total || '—')
+      + '<div class="year-progress-mini"><span style="width:' + pct + '%"></span></div></td>'
+      + '<td class="num page-position">' + (row.page || '—') + ' / ' + (row.page_count || '—') + '</td>'
+      + '<td><span class="tag tag-cat-' + safeStatus + '">'
+      + esc(statusText[status] || status) + '</span></td>'
+      + '<td class="year-description">' + descriptionTags + descriptionHtml + '</td>'
+      + '</tr>'
+      + '<tr class="year-page-detail" data-year-detail="' + esc(row.year) + '" style="display:'
+      + (expandedYears.has(String(row.year)) ? 'table-row' : 'none') + '">'
+      + '<td colspan="5"><table class="year-page-table"><colgroup>'
+      + '<col style="width:140px"><col style="width:112px"><col style="width:96px"><col>'
+      + '</colgroup><thead><tr>'
+      + '<th class="page-index">页码</th><th class="page-counts">爬取数量 / 本页数量</th>'
+      + '<th class="page-status">是否完成</th><th class="page-ids">编号明细</th>'
+      + '</tr></thead><tbody>'
+      + pageTableRows + '</tbody></table>'
+      + matchSummary
+      + unmatchedHtml + '</td></tr>';
+  });
+  return html + '</tbody></table></div></details>';
+}
+
+function renderAgentTaskCard(uploadState, parseSettings) {
+  const el = document.getElementById('agent_task_card');
+  if (!el) return;
+  const prog = uploadState.progress || {};
+  const queue = uploadState.parse_queue || {};
+  const migration = uploadState.migration || {};
+  const indexStatus = uploadState.version_index || {};
+  const indexSources = indexStatus.sources || {};
+  const backfillStatus = uploadState.backfill_status || {};
+  const dateProgress = uploadState.date_progress || {};
+  const maintenanceFlags = uploadState.maintenance_flags || {};
+  const retry = queue.retry || [];
+  const active = queue.active || [];
+  const combinedDateTotal = Number((dateProgress.ccdi || {}).total || 0)
+    + Number((dateProgress.bit || {}).total || 0);
+  const combinedDateDone = Number((dateProgress.ccdi || {}).dated || 0)
+    + Number((dateProgress.bit || {}).dated || 0);
+  const total = combinedDateTotal || prog.total || 0;
+  const current = combinedDateTotal ? combinedDateDone : (prog.current || 0);
+  const pct = total > 0 ? Math.min(100, Math.round(100 * current / total)) : 0;
+  let html = '<div class="lib-title">上传与解析</div>'
+    + '<div class="stat">' + current + (total ? ' / ' + total : '') + '</div>'
+    + '<div class="muted">' + esc(prog.message || '暂无上传任务') + '</div>'
+    + '<div class="bar"><span style="width:' + pct + '%"></span></div>'
+    + '<div class="stat-row">'
+    + '<span class="pill running">解析中 ' + active.length + '</span>'
+    + '<span class="pill failed">待重试 ' + retry.length + '</span>'
+    + (queue.wave ? '<span class="pill pending">波次 ' + queue.wave + '</span>' : '')
+    + '</div>'
+    + '<div class="muted" style="margin-top:7px">并发上限 '
+    + esc(parseSettings.max_parsing_documents || 500)
+    + ' · 超时 ' + esc(parseSettings.parse_timeout_minutes || 30) + ' 分钟</div>';
+  const dateCard = (source, title) => {
+    const state = backfillStatus[source] || {};
+    const sourceIndex = indexSources[source] || {};
+    const stats = dateProgress[source] || {};
+    const totalDocs = stats.total || state.total || 0;
+    // 日期数量以 documents 中真实写入日期的数量为准；扫描页数只用于年份表。
+    const currentDocs = Number(stats.dated || 0);
+    const percent = totalDocs > 0 ? Math.min(100, Math.round(100 * currentDocs / totalDocs)) : 0;
+    const status = state.status || (stats.missing ? 'pending' : 'done');
+    const statusLabel = {pending:'待补录', running:'补录中', done:'已完成', error:'补录异常'}[status] || status;
+    const cls = status === 'done' ? 'done' : (status === 'error' ? 'failed' : (status === 'running' ? 'running' : 'pending'));
+    const sourceIndexReady = !!sourceIndex.ready;
+    const sourceFresh = !!maintenanceFlags[source];
+    const matchAudit = state.match_audit || {};
+    const sourceError = sourceIndex.error || (status === 'error' ? state.message : '');
+    const throttleWarning = state.throttle_message
+      ? '<div class="bf-error">限流警告：' + esc(state.throttle_message) + '</div>'
+      : '';
+    const unmatchedWarning = Number(state.unmatched_local_count || 0) > 0
+      ? '<div class="bf-error">本地编号未在网页检索结果中匹配：'
+        + esc(state.unmatched_local_count) + ' 条'
+        + (Array.isArray(state.unmatched_local_ids) && state.unmatched_local_ids.length
+          ? '<details class="page-id-details"><summary>展开本地编号</summary>'
+            + '<div class="bf-msg">' + esc(state.unmatched_local_ids.join('、')) + '</div>'
+            + '</details>'
+          : '')
+        + '</div>'
+      : '';
+    const matchAuditTags = source === 'ccdi' && matchAudit.unique_web_count !== undefined
+      ? '<div class="bf-tags">'
+        + '<span class="tag">网页去重 ' + esc(matchAudit.unique_web_count) + '</span>'
+        + '<span class="tag ' + (Number(matchAudit.repeated_count || 0) ? 'tag-failed' : 'tag-yes') + '">'
+        + '跨年重复 ' + esc(matchAudit.repeated_count || 0) + '</span>'
+        + '<span class="tag ' + (Number(matchAudit.same_year_repeated_count || 0) ? 'tag-failed' : 'tag-yes') + '">'
+        + '同年重复 ' + esc(matchAudit.same_year_repeated_count || 0) + '</span>'
+        + '<span class="tag ' + (Number(matchAudit.unmatched_count || 0) ? 'tag-failed' : 'tag-yes') + '">'
+        + '未匹配 ' + esc(matchAudit.unmatched_count || 0) + '</span>'
+        + '<span class="tag ' + (Number(matchAudit.matched_missing_date_count || 0) ? 'tag-failed' : 'tag-yes') + '">'
+        + '匹配但缺日期 ' + esc(matchAudit.matched_missing_date_count || 0) + '</span>'
+        + '<span class="tag ' + (Number(matchAudit.matched_wrong_year_count || 0) ? 'tag-failed' : 'tag-yes') + '">'
+        + '年份不符 ' + esc(matchAudit.matched_wrong_year_count || 0) + '</span></div>'
+      : '';
+    const tags = [];
+    if (source !== 'ccdi') {
+      if (state.page && state.page_count) {
+        tags.push('目录第 ' + esc(state.page) + '/' + esc(state.page_count) + ' 页');
+      }
+      if (state.total_declared) tags.push('目录共 ' + esc(state.total_declared) + ' 条');
+    }
+    if (state.updated_at && source !== 'ccdi') tags.push('更新 ' + esc(fmtTime(state.updated_at)));
+    if (Number(stats.filename_dated || 0) > 0) {
+      tags.push('文件名补日期 ' + esc(stats.filename_dated));
+    }
+    const indexTags = [];
+    if (sourceIndex.ready) indexTags.push('索引已就绪');
+    if (sourceIndex.versions !== undefined) {
+      indexTags.push('版本族 ' + esc(sourceIndex.versions));
+    }
+    if (sourceIndex.built_at) indexTags.push('建立于 ' + esc(fmtTime(sourceIndex.built_at)));
+    if (sourceIndex.missing_dates) {
+      indexTags.push('缺日期 ' + esc(sourceIndex.missing_dates));
+    }
+    return '<div class="backfill-mini">'
+      + '<div class="bf-head"><span class="bf-title">' + esc(title) + '</span>'
+      + '<span class="pill ' + cls + '">' + esc(statusLabel) + '</span></div>'
+      + '<div class="bf-section">'
+      + '<div class="bf-section-title"><span class="tag tag-cat">日期补全</span></div>'
+      + '<div class="bf-num-line"><span class="bf-num">' + currentDocs + ' / ' + totalDocs + '</span>'
+      + '<span class="muted">已补 / 总数</span></div>'
+      + '<div class="bar"><span style="width:' + percent + '%"></span></div>'
+      + (tags.length ? '<div class="bf-tags">' + tags.map(x => '<span class="tag">' + x + '</span>').join('') + '</div>' : '')
+      + '<div class="bf-msg">' + esc(state.message || ((stats.missing || 0) + ' 条缺日期'))
+      + (state.updated_at && source === 'ccdi'
+          ? ' · 更新 ' + esc(fmtTime(state.updated_at)) : '') + '</div>'
+      + throttleWarning
+      + unmatchedWarning
+      + matchAuditTags
+      + '</div>'
+      + '<div class="bf-divider"></div>'
+      + '<div class="bf-section">'
+      + '<div class="bf-section-title"><span class="tag tag-retry-pending">索引建立</span>'
+      + '<span class="pill ' + (sourceIndexReady ? 'done' : 'pending') + '">'
+      + (sourceIndexReady ? '已建立' : '待建立') + '</span>'
+      + '<span class="tag ' + (sourceFresh ? 'tag-yes' : 'tag-no') + '">时效 '
+      + (sourceFresh ? 'true' : 'false') + '</span></div>'
+      + '<div class="bar"><span style="width:' + (sourceIndexReady ? 100 : 0) + '%"></span></div>'
+      + '<div class="bf-tags">' + indexTags.map(x => '<span class="tag">' + x + '</span>').join('') + '</div>'
+      + '<div class="bf-msg">' + esc(sourceIndex.reason || (sourceIndexReady ? '索引可用于上传' : '日期补齐后自动建立')) + '</div>'
+      + '</div>'
+      + (sourceError ? '<div class="bf-error">报错：' + esc(sourceError) + '</div>' : '')
+      + '</div>';
+  };
+  html += '<div class="backfill-grid">'
+    + dateCard('ccdi', '中纪检')
+    + dateCard('bit', '校纪检')
+    + '</div>';
+  html += yearProgressPanel(backfillStatus.ccdi || {});
+  if (migration.status) {
+    const label = {running:'迁库中', uploading:'重建完成 · 正在重传', done:'迁库完成', error:'迁库失败', interrupted:'迁库中断'}[migration.status] || migration.status;
+    const cls = migration.status === 'done' ? 'done' : (migration.status === 'error' ? 'failed' : 'pending');
+    html += '<div class="stat-row"><span class="pill ' + cls + '">' + esc(label) + '</span></div>';
+    if (migration.error) html += '<div class="muted" style="color:#b91c1c">' + esc(migration.error) + '</div>';
+  }
+  if (el.dataset.taskSig === html) {
+    renderAgentRetryBoxes(uploadState);
+    return;
+  }
+  el.dataset.taskSig = html;
+  const oldYearTable = el.querySelector('.year-table-wrap');
+  const oldYearScrollTop = oldYearTable ? oldYearTable.scrollTop : 0;
+  const oldWindowScrollY = window.scrollY;
+  el.innerHTML = html;
+  renderAgentRetryBoxes(uploadState);
+  requestAnimationFrame(() => {
+    const newYearTable = el.querySelector('.year-table-wrap');
+    if (newYearTable && oldYearScrollTop > 0) {
+      newYearTable.scrollTop = oldYearScrollTop;
+    }
+    if (Math.abs(window.scrollY - oldWindowScrollY) > 2) {
+      window.scrollTo(0, oldWindowScrollY);
+    }
+  });
+}
+
+function renderAgentRetryBoxes(uploadState) {
+  const rows = (uploadState.parse_queue || {}).retry || [];
+  for (const source of ['ccdi', 'bit']) {
+    const el = document.getElementById('agent_retry_' + source);
+    if (!el) continue;
+    const items = rows.filter(x => x.source === source);
+    const signature = items.map(x => String(x.document_id || '')).join('|');
+    if (el.dataset.sig === signature) continue;
+    const oldDetails = el.querySelector('details');
+    const wasOpen = oldDetails ? oldDetails.open : false;
+    el.dataset.sig = signature;
+    if (!items.length) {
+      el.innerHTML = '';
+      continue;
+    }
+    el.innerHTML = '<details class="retry-box"' + (wasOpen ? ' open' : '') + '>'
+      + '<summary>解析超时/失败待重试 ' + items.length + ' 个</summary>'
+      + '<div class="task-id-list">'
+      + items.map(x => '<span class="tag tag-failed" title="'
+          + esc(x.file_name || x.reason || '') + '">'
+          + esc(x.document_id || '') + '</span>').join('')
+      + '</div></details>';
+  }
 }
 
 async function refreshAgentStatus() {
@@ -1055,6 +1620,36 @@ async function saveAgentConfig() {
   await refreshAgentStatus();
 }
 
+function openMigrationDialog() {
+  if (uiRunning || uiStateBusy) {
+    setCtlStatus('当前有任务运行，完成或终止后才能迁库', true);
+    return;
+  }
+  document.getElementById('migration_dialog').classList.add('open');
+}
+
+function closeMigrationDialog() {
+  document.getElementById('migration_dialog').classList.remove('open');
+}
+
+async function confirmMigration() {
+  const btn = document.getElementById('migration_confirm_btn');
+  btn.disabled = true;
+  btn.textContent = '正在启动…';
+  try {
+    const r = await api('/api/migrate', { method: 'POST' });
+    if (!r.ok) {
+      setCtlStatus('启动迁库失败：' + (r.data.error || r.status), true);
+      return;
+    }
+    closeMigrationDialog();
+    setCtlStatus(r.data.message || '迁库任务已启动', false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '再次确认并迁库';
+  }
+}
+
 // 网址过长时只显示末尾，避免撑破卡片
 function shortUrl(u) {
   const text = String(u || '');
@@ -1070,6 +1665,7 @@ function httpTag(code) {
 }
 
 function progressCard(title, p, lastCrawl, lastUpload, extra) {
+  const variant = title === '中纪检' ? ' progress-ccdi' : (title === '校纪检' ? ' progress-bit' : '');
   const running = p.status === 'running';
   const total = p.total || 0;
   const hasTotal = total > 0;
@@ -1103,14 +1699,14 @@ function progressCard(title, p, lastCrawl, lastUpload, extra) {
         + '上一个页面 ' + httpTag(p.prev_status) + esc(shortUrl(p.prev_url)) + '</div>';
     }
   }
-  return '<div class="card progress-card' + (p.status === 'error' ? ' is-error' : '') + '">'
+  return '<div class="card progress-card' + variant + (p.status === 'error' ? ' is-error' : '') + '">'
     + stopBtn
     + '<div class="pc-title">' + esc(title) + '</div>'
     + '<span class="tag ' + p.status + '">'
     + ({running: '运行中', idle: '空闲', error: '异常中断'}[p.status] || p.status) + '</span>'
     + '<div class="pc-num">' + num + '</div>'
     + bar
-    + (/^(完成，本次新增 0 个（目录总数仍为|无更新（目录页共)/.test(p.message || '')
+    + (/^(完成，本次新增 0 个（目录总数仍为|无更新（|爬取任务空闲；日期补录进度见学科智能体卡片)/.test(p.message || '')
         ? '<div class="pc-msg"><span class="tag tag-noupdate">无更新</span></div>'
         : '<div class="pc-msg">' + esc(p.message || '') + '</div>')
     + activity
@@ -1288,7 +1884,14 @@ function renderFiles(data) {
   } else {
     tbody.innerHTML = data.files.map(f => '<tr>'
       + '<td>' + sourceTag(f.source) + '</td>'
-      + '<td>' + esc(displayTitle(f.title)) + '</td>'
+      + '<td>' + esc(displayTitle(f.title))
+      + (f.version_count > 1
+          ? ' <span class="tag ' + (f.is_latest ? 'badge-latest' : 'tag-no') + '">'
+            + f.version_count + ' 个版本' + (f.is_latest ? ' · 最新' : ' · 历史') + '</span>'
+          : '')
+      + (f.date_source === 'filename'
+          ? ' <span class="tag tag-no">文件名补日期</span>' : '')
+      + '</td>'
       + '<td>' + (f.category_path ? '<span class="tag tag-cat">' + esc(f.category_path) + '</span>' : '') + '</td>'
       + '<td>' + esc(f.crawled_at || '') + '</td>'
       + '<td>' + (f.uploaded_at
@@ -1302,6 +1905,124 @@ function renderFiles(data) {
   document.getElementById('files_next').disabled = filesPage >= filesPages;
   renderPager();
   updateSortArrows();
+  renderVersionFamilies(data.multi_versions || []);
+}
+
+function renderVersionFamilies(families) {
+  allVersionFamilies = families || [];
+  renderVersionFamilyPage();
+}
+
+function filteredVersionFamilies() {
+  const query = versionQuery.trim().toLowerCase();
+  return allVersionFamilies.filter(family => {
+    if (versionSource !== 'all' && family.source !== versionSource) return false;
+    if (!query) return true;
+    const versions = family.versions || [];
+    const haystack = [
+      family.title || '',
+      ...versions.flatMap(v => [v.title || '', v.link_suffix || '', v.location || ''])
+    ].join(' ').toLowerCase();
+    return haystack.includes(query);
+  });
+}
+
+function renderVersionFamilyPage() {
+  const el = document.getElementById('version_families');
+  if (!el) return;
+  const families = filteredVersionFamilies();
+  const pages = Math.max(1, Math.ceil(families.length / versionPageSize));
+  versionPage = Math.min(Math.max(1, versionPage), pages);
+  const start = (versionPage - 1) * versionPageSize;
+  const pageRows = families.slice(start, start + versionPageSize);
+  if (!families.length) {
+    el.innerHTML = '<div class="muted">当前没有多版本文档。</div>';
+  } else {
+    el.innerHTML = '<div class="muted" style="margin-bottom:6px">共 ' + families.length
+      + ' 个标题族；展开可查看全部本地版本、链接后缀和位置。</div>'
+      + pageRows.map((family, idx) => {
+      const versions = family.versions || [];
+      return '<details class="version-family"' + (versionPage === 1 && idx === 0 ? ' open' : '') + '>'
+        + '<summary><b>' + esc(displayTitle(family.title)) + '</b>'
+        + sourceTag(family.source)
+        + '<span class="tag badge-latest">最新版本</span>'
+        + '<span class="muted">共 ' + versions.length + ' 个版本</span></summary>'
+        + '<div class="version-row version-head"><div>链接后缀</div><div>标题</div><div>位置</div><div>发布日期</div></div>'
+        + versions.map(v =>
+          '<div class="version-row' + (v.is_latest ? ' latest' : '') + '">'
+          + '<div><span class="tag tag-time">' + esc(v.link_suffix || '—') + '</span></div>'
+          + '<div>' + esc(displayTitle(v.title || '')) + '</div>'
+          + '<div title="' + esc(v.location || '') + '">' + esc(v.location ? shortUrl(v.location) : '—') + '</div>'
+          + '<div>' + esc(v.publish_date || '日期未知')
+          + (v.date_source === 'filename'
+              ? ' <span class="tag tag-no">文件名补年份</span>' : '')
+          + (v.is_latest ? ' <span class="tag badge-latest">最新</span>' : '')
+          + '</div></div>'
+        ).join('')
+        + '</details>';
+      }).join('');
+  }
+  const pager = document.getElementById('version_pager');
+  if (pager) {
+    const wanted = new Set([1, pages, versionPage - 2, versionPage - 1, versionPage, versionPage + 1, versionPage + 2]);
+    const nums = [...wanted].filter(n => n >= 1 && n <= pages).sort((a, b) => a - b);
+    let html = '';
+    let prev = 0;
+    nums.forEach(n => {
+      if (prev && n - prev > 1) html += '<span class="gap">…</span>';
+      html += n === versionPage
+        ? '<button class="active" disabled>' + n + '</button>'
+        : '<button onclick="setVersionPage(' + n + ')">' + n + '</button>';
+      prev = n;
+    });
+    pager.innerHTML = html;
+  }
+  const info = document.getElementById('version_page_info');
+  if (info) info.textContent = '第 ' + versionPage + ' / ' + pages + ' 页 · 共 ' + families.length + ' 个标题族';
+  const jump = document.getElementById('version_jump');
+  if (jump) {
+    jump.max = pages;
+    jump.value = versionPage;
+  }
+  document.querySelectorAll('#version_source_tabs .tab').forEach(tab => {
+    tab.classList.toggle('active', tab.dataset.source === versionSource);
+  });
+}
+
+function toggleVersionsCard() {
+  versionCardOpen = !versionCardOpen;
+  const body = document.getElementById('version_card_body');
+  const btn = document.getElementById('version_toggle_btn');
+  if (body) body.style.display = versionCardOpen ? 'block' : 'none';
+  if (btn) btn.textContent = versionCardOpen ? '▼' : '▶';
+}
+
+function changeVersionSearch(value) {
+  versionQuery = value || '';
+  versionPage = 1;
+  renderVersionFamilyPage();
+}
+
+function setVersionSource(value) {
+  versionSource = ['ccdi', 'bit'].includes(value) ? value : 'all';
+  versionPage = 1;
+  renderVersionFamilyPage();
+}
+
+function changeVersionPageSize(value) {
+  versionPageSize = Math.max(1, parseInt(value, 10) || 10);
+  versionPage = 1;
+  renderVersionFamilyPage();
+}
+
+function setVersionPage(page) {
+  const pages = Math.max(1, Math.ceil(filteredVersionFamilies().length / versionPageSize));
+  versionPage = Math.min(Math.max(1, parseInt(page, 10) || 1), pages);
+  renderVersionFamilyPage();
+}
+
+function jumpVersionPage(value) {
+  setVersionPage(value);
 }
 
 // 历史记录里只显示标题本身，去掉可能带上的「子分类[12] 」/「[12] 」前缀
@@ -1376,7 +2097,7 @@ async function refresh() {
     const pr = (data.summary && data.summary.progress) || {};
     uiStateBusy = ['ccdi', 'bit', 'upload'].some(
       k => (pr[k] || {}).status === 'running'
-    );
+    ) || !!(data.settings && (data.settings.migration_running || data.settings.index_building));
   } catch (e) {
     uiStateBusy = false;
   }
@@ -1387,23 +2108,38 @@ async function refresh() {
   catch (e) { console.error('renderAlerts 失败', e); }
   const uploadRunning = data.settings ? !!data.settings.upload_running : false;
   const crawlRunning = data.settings ? !!data.settings.crawl_running : false;
+  const migrationRunning = data.settings ? !!data.settings.migration_running : false;
   if (prevUploadRunning && !uploadRunning) {
     refreshAgentStatus();
   }
-  const runningNow = uploadRunning || crawlRunning;
+  const runningNow = uploadRunning || crawlRunning || migrationRunning;
   if (runningNow || prevRunningAny) {
     loadFiles();
   }
   prevUploadRunning = uploadRunning;
   prevRunningAny = runningNow;
   const s = data.summary;
+  try {
+    renderAgentTaskCard(
+      {
+        progress: s.progress.upload,
+        parse_queue: s.parse_queue || {},
+        migration: s.dataset_migration || {},
+        version_index: (data.settings && data.settings.version_index_status) || {},
+        backfill_status: s.backfill_status || {},
+        date_progress: s.date_progress || {},
+        maintenance_flags: (data.settings && data.settings.maintenance_flags) || {}
+      },
+      data.settings.parse_settings || {}
+    );
+  } catch (e) { console.error('renderAgentTaskCard 失败', e); }
   lastSettings = data.settings || {};
   const firstRun = data.settings ? !!data.settings.first_run_pending : false;
   const schedulerOff = data.settings && data.settings.scheduler_enabled === false;
   try {
     renderUploadProgress(
       s.progress.upload,
-      uploadRunning,
+      uploadRunning || migrationRunning,
       JSON.stringify(s.last_upload_time || {})
     );
   } catch (e) { console.error('renderUploadProgress 失败', e); }
@@ -1524,6 +2260,11 @@ def create_monitor_app(controller) -> Flask:
                     "current_category": progress["ccdi"].get("category", ""),
                     # 中纪检上次各区间爬到哪（正向边界 / 倒爬起点与游标 / 最大有效编号）
                     "id_walk_ccdi": (snap.get("id_walk", {}) or {}).get("ccdi", {}) or {},
+                    "parse_queue": snap.get("parse_queue", {}),
+                    "dataset_migration": snap.get("dataset_migration", {}),
+                    "backfill_status": snap.get("backfill_status", {}),
+                    "date_progress": controller.date_source_stats(snap),
+                    "version_index": snap.get("version_index_meta", {}),
                 },
                 "settings": settings,
                 "alerts": state.list_alerts(),
@@ -1553,22 +2294,42 @@ def create_monitor_app(controller) -> Flask:
         }
         keyfunc = keyfuncs.get(sort_key, keyfuncs["crawled_at"])
         docs.sort(key=keyfunc, reverse=(direction == "desc"))
+        version_index = controller.state.snapshot().get("version_index", {})
+        family_by_doc: dict[str, dict] = {}
+        for family in version_index.values():
+            versions = family.get("versions", []) if isinstance(family, dict) else []
+            for version in versions:
+                doc_key = str(version.get("document_key") or "")
+                if doc_key:
+                    family_by_doc[doc_key] = family
 
         total = len(docs)
         pages = max(1, (total + page_size - 1) // page_size)
         page = min(page, pages)
         start = (page - 1) * page_size
-        rows = [
-            {
-                "source": d.get("source"),
-                "title": d.get("title"),
-                "category_path": d.get("category_path"),
-                "crawled_at": d.get("crawled_at"),
-                "uploaded_at": d.get("uploaded_at"),
-                "url": d.get("url"),
-            }
-            for d in docs[start : start + page_size]
-        ]
+        rows = []
+        for doc in docs[start : start + page_size]:
+            family = family_by_doc.get(str(doc.get("doc_key") or ""), {})
+            versions = family.get("versions") or []
+            rows.append(
+                {
+                    "source": doc.get("source"),
+                    "title": doc.get("title"),
+                    "category_path": doc.get("category_path"),
+                    "crawled_at": doc.get("crawled_at"),
+                    "publish_date": doc.get("publish_date"),
+                    "date_source": doc.get("date_source"),
+                    "uploaded_at": doc.get("uploaded_at"),
+                    "url": doc.get("url"),
+                    "version_id": doc.get("version_id"),
+                    "version_family_key": doc.get("version_family_key"),
+                    "version_count": len(versions),
+                    "is_latest": bool(
+                        family.get("latest_version_id")
+                        and family.get("latest_version_id") == doc.get("version_id")
+                    ),
+                }
+            )
         return jsonify(
             {
                 "total": total,
@@ -1578,6 +2339,7 @@ def create_monitor_app(controller) -> Flask:
                 "sort": sort_key,
                 "dir": direction,
                 "files": rows,
+                "multi_versions": controller.state.version_families(multi_only=True),
             }
         )
 
@@ -1630,6 +2392,13 @@ def create_monitor_app(controller) -> Flask:
     def api_upload():
         try:
             return jsonify(controller.start_upload())
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
+
+    @app.post("/api/migrate")
+    def api_migrate():
+        try:
+            return jsonify(controller.start_dataset_migration())
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 409
 

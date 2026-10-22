@@ -32,12 +32,15 @@ from crawl_bit_jwjc_regulations import (
     BIT_INDEX,
     _fetch_html,
     _parse_declared_total,
+    backfill_bit_publish_dates,
     crawl_bit_jwjc_regulations,
 )
 from crawl_ccdi_regulations import (
     THROTTLE_ALERT_KEY,
     THROTTLE_ALERT_TEXT,
     _estimate_all_data_total,
+    audit_ccdi_match_dates,
+    backfill_ccdi_publish_years,
     crawl_ccdi_by_id,
     crawl_ccdi_regulations,
 )
@@ -54,7 +57,12 @@ from crawl_common import (
 from crawler_state import CrawlerState
 from daily_run_log import DailyRunLog
 from monitor_web_ui import run_monitor_server
-from ragflow_kb_uploader import get_agent_status, run_scheduled_uploads
+from ragflow_kb_uploader import (
+    RagflowKbUploader,
+    get_agent_status,
+    migrate_dataset_libraries,
+    run_scheduled_uploads,
+)
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -252,7 +260,7 @@ def run_crawl_jobs(
     categories: list[str] | None = None,
     retry_ids: list[int] | None = None,
     retry_probe=None,
-) -> None:
+) -> dict[str, int]:
     """执行爬取环节。max_items 用于测试模式：每个来源最多爬取该数量。
     parallel=True 且同时爬取两个来源时，中纪检与校纪检并行执行。
     categories 仅用于中纪检：只爬取这些导航码（重试被跳过的子分类）。
@@ -290,7 +298,7 @@ def run_crawl_jobs(
     if not rotate_ua:
         user_agents = []
 
-    def run_ccdi() -> None:
+    def run_ccdi() -> int:
         logger.info("开始中纪检爬取")
         mode = str(crawl_cfg.get("crawl_mode") or "id_walk").strip().lower()
         first_run_now = state.is_first_run()
@@ -314,6 +322,10 @@ def run_crawl_jobs(
             )
             raise
         logger.info("中纪检完成，新增 %s 个", ccdi_new)
+        state.set_progress(
+            "ccdi", extra={"last_crawl_new_count": int(ccdi_new)}
+        )
+        return int(ccdi_new)
 
     def _run_ccdi_impl(mode: str, first_run_now: bool) -> int:
         if retry_ids:
@@ -410,7 +422,7 @@ def run_crawl_jobs(
             first_run=first_run_now,
         )
 
-    def run_bit() -> None:
+    def run_bit() -> int:
         logger.info("开始校纪检爬取")
         try:
             bit_new = crawl_bit_jwjc_regulations(
@@ -443,27 +455,33 @@ def run_crawl_jobs(
             )
             raise
         logger.info("校纪检完成，新增 %s 个", bit_new)
+        state.set_progress(
+            "bit", extra={"last_crawl_new_count": int(bit_new)}
+        )
+        return int(bit_new)
 
     want_ccdi = source in ("all", "ccdi")
     want_bit = source in ("all", "bit")
 
+    results = {"ccdi": 0, "bit": 0}
     if parallel and want_ccdi and want_bit:
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = {
-                "中纪检": pool.submit(run_ccdi),
-                "校纪检": pool.submit(run_bit),
+                "ccdi": pool.submit(run_ccdi),
+                "bit": pool.submit(run_bit),
             }
-            for name, future in futures.items():
+            for source_key, future in futures.items():
                 try:
-                    future.result()
+                    results[source_key] = int(future.result())
                 except Exception:
-                    logger.exception("%s 爬取失败", name)
-        return
+                    logger.exception("%s 爬取失败", source_key)
+        return results
 
     if want_ccdi:
-        run_ccdi()
+        results["ccdi"] = run_ccdi()
     if want_bit:
-        run_bit()
+        results["bit"] = run_bit()
+    return results
 
 
 def run_upload_jobs(
@@ -496,6 +514,11 @@ class JobController:
         self.output_dir = Path(config["output_dir"]).resolve()
         self._crawl_running = False
         self._upload_running = False
+        self._migration_running = False
+        self._last_crawl_results = {"ccdi": 0, "bit": 0}
+        self._index_building = False
+        index_meta = state.get_version_index_status()
+        self._index_ready = bool(index_meta.get("ready"))
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self.mode = "run"  # run | test
@@ -535,6 +558,12 @@ class JobController:
 
     def get_settings(self) -> dict:
         crawl_cfg = self.config.get("crawl", {}) or {}
+        index_status = self.state.get_version_index_status()
+        maintenance_flags = self.state.get_maintenance_flags()
+        self._index_ready = all(
+            bool(maintenance_flags.get(source))
+            for source in ("ccdi", "bit")
+        )
         return {
             "mode": self.mode,
             "test_count": self.test_count,
@@ -568,6 +597,31 @@ class JobController:
             "playwright_headless": bool(crawl_cfg.get("playwright_headless", True)),
             "crawl_running": self._crawl_running,
             "upload_running": self._upload_running,
+            "migration_running": self._migration_running,
+            "index_building": self._index_building,
+            "index_ready": self._index_ready,
+            "version_index_status": index_status,
+            "maintenance_flags": maintenance_flags,
+            "parse_settings": {
+                "max_parsing_documents": int(
+                    ((self.config.get("upload", {}) or {}).get(
+                        "max_parsing_documents", 500
+                    ))
+                    or 500
+                ),
+                "parse_timeout_minutes": float(
+                    ((self.config.get("upload", {}) or {}).get(
+                        "parse_timeout_minutes", 30
+                    ))
+                    or 30
+                ),
+                "parse_retry_rounds": int(
+                    ((self.config.get("upload", {}) or {}).get(
+                        "parse_retry_rounds", 1
+                    ))
+                    or 0
+                ),
+            },
             "paused": self._pause_event.is_set(),
         }
 
@@ -719,6 +773,10 @@ class JobController:
             "upload.strategy": up.get("strategy", "interval"),
             "upload.interval_days": up.get("interval_days", 3),
             "upload.min_age_days": up.get("min_age_days", 3),
+            "upload.max_parsing_documents": up.get("max_parsing_documents", 500),
+            "upload.parse_timeout_minutes": up.get("parse_timeout_minutes", 30),
+            "upload.parse_poll_seconds": up.get("parse_poll_seconds", 10),
+            "upload.parse_retry_rounds": up.get("parse_retry_rounds", 1),
             "ragflow.base_url": rag.get("base_url", ""),
             "ragflow.chunk_method": rag.get("chunk_method", "laws"),
             "ragflow.dataset_name_ccdi": rag.get("dataset_name_ccdi", "中纪检"),
@@ -900,6 +958,14 @@ class JobController:
         """标记/取消“首次运行”，界面会据此显示提示。"""
         self.state.set_first_run(value)
 
+    def _version_index_is_ready(self) -> bool:
+        """上传门禁以两来源的日期/索引时效标志为准。"""
+        flags = self.state.get_maintenance_flags()
+        self._index_ready = all(
+            bool(flags.get(source)) for source in ("ccdi", "bit")
+        )
+        return self._index_ready
+
     def recover_stale_progress(self) -> None:
         """进程启动时：把上次被强杀（Ctrl+C / kill）遗留的「运行中」状态改回空闲。
 
@@ -930,10 +996,736 @@ class JobController:
                 "、".join(names) or "—",
                 f"，并把 {len(updates)} 个子分类标为已中断" if updates else "",
             )
+        migration = snap.get("dataset_migration") or {}
+        if migration.get("status") == "running":
+            self.state.set_dataset_migration(
+                status="interrupted",
+                error="迁库进程上次被中断；请重新点击「迁库」完成重建",
+            )
+        elif migration.get("status") == "uploading":
+            self.state.set_dataset_migration(
+                status="interrupted",
+                error="新库已创建，但重新上传被中断；点击「立即上传」继续",
+            )
+        queue = snap.get("parse_queue") or {}
+        active = [dict(row) for row in queue.get("active", [])]
+        if active:
+            retry = [dict(row) for row in queue.get("retry", [])]
+            seen = {
+                (row.get("dataset_id"), row.get("document_id")) for row in retry
+            }
+            for row in active:
+                key = (row.get("dataset_id"), row.get("document_id"))
+                if key not in seen:
+                    row["reason"] = "程序重启前的解析未完成"
+                    retry.append(row)
+            self.state.set_parse_queue(
+                {
+                    "active": [],
+                    "retry": retry,
+                    "wave": int(queue.get("wave") or 0),
+                    "message": f"已恢复 {len(active)} 个中断的解析文件，等待重试",
+                }
+            )
+
+    def _missing_date_targets(self) -> tuple[list[dict], list[dict]]:
+        """返回可联网补录日期的中纪检、校纪检缺失记录。"""
+        docs = self.state.snapshot().get("documents") or {}
+        missing_ccdi: list[dict] = []
+        missing_bit: list[dict] = []
+        for doc_key, meta in docs.items():
+            if not isinstance(meta, dict) or meta.get("publish_date"):
+                continue
+            key = str(doc_key)
+            if meta.get("source") == "ccdi" and re.fullmatch(r"ccdi:\d+", key):
+                missing_ccdi.append(dict(meta))
+            elif meta.get("source") == "bit" and key.startswith("bit:"):
+                missing_bit.append(dict(meta))
+        return missing_ccdi, missing_bit
+
+    def date_source_stats(self, snapshot: dict | None = None) -> dict:
+        """按来源统计可联网补录文档的日期完成度。"""
+        docs = (snapshot or self.state.snapshot()).get("documents") or {}
+        result = {
+            "ccdi": {
+                "total": 0,
+                "dated": 0,
+                "missing": 0,
+                "filename_dated": 0,
+            },
+            "bit": {
+                "total": 0,
+                "dated": 0,
+                "missing": 0,
+                "filename_dated": 0,
+            },
+        }
+        for doc_key, meta in docs.items():
+            if not isinstance(meta, dict):
+                continue
+            source = str(meta.get("source") or "")
+            if source not in result:
+                continue
+            result[source]["total"] += 1
+            if meta.get("publish_date"):
+                result[source]["dated"] += 1
+                if meta.get("date_source") == "filename":
+                    result[source]["filename_dated"] += 1
+            else:
+                result[source]["missing"] += 1
+        return result
+
+    def prepare_version_index_on_startup(
+        self, *, force_full_dates: bool | None = None
+    ) -> dict:
+        """日期补录完成后再生成最终索引；日期完整时仅做本地核对。"""
+        if self._index_building:
+            return {"ready": False, "building": True, "message": "索引正在准备"}
+        flags = self.state.get_maintenance_flags()
+        pending = [
+            source for source in ("ccdi", "bit")
+            if not bool(flags.get(source))
+        ]
+        if not pending:
+            self._index_ready = True
+            return {
+                "ready": True,
+                "building": False,
+                "imported": 0,
+                "message": "中纪检、校纪检时效标志均为 true，沿用已有日期与索引",
+            }
+        # 首次运行不做“本地数量等于网页数量”的快速通过判断：
+        # 即使某个年份数量碰巧相同，也逐页核对网页编号，避免漏号或错号。
+        if force_full_dates is None:
+            force_full_dates = self.state.is_first_run()
+        result = self.run_date_index_maintenance(
+            tuple(pending),
+            force_full_dates=bool(force_full_dates),
+        )
+        flags = self.state.get_maintenance_flags()
+        ready = all(bool(flags.get(source)) for source in ("ccdi", "bit"))
+        errors = result.get("errors") or {}
+        return {
+            "ready": ready,
+            "building": False,
+            "imported": 0,
+            "errors": errors,
+            "message": (
+                "日期补全与版本索引已全部完成"
+                if ready
+                else "；".join(f"{k}: {v}" for k, v in errors.items())
+                or "仍有来源未完成日期补全或索引建立"
+            ),
+        }
+        self._index_building = True
+        errors: list[str] = []
+        source_errors = {"ccdi": "", "bit": ""}
+        imported = 0
+        try:
+            try:
+                imported = self.state.import_unregistered_local_files(
+                    self.output_dir, rebuild_index=False
+                )
+            except Exception as exc:
+                errors.append(f"扫描遗留 PDF 失败：{exc}")
+                logger.exception("扫描本地未登记 PDF 失败")
+
+            missing_ccdi, missing_bit = self._missing_date_targets()
+            prior_snapshot = self.state.snapshot()
+            prior_backfill = prior_snapshot.get("backfill_status", {}) or {}
+            prior_ccdi = prior_backfill.get("ccdi") or {}
+            if prior_ccdi.get("force_full"):
+                # 清除旧版本遗留的强制重扫标记，但绝不动年份/页码断点。
+                self.state.set_backfill_status(
+                    "ccdi",
+                    extra={"force_full": False, "year_table_version": 2},
+                )
+                prior_snapshot = self.state.snapshot()
+                prior_backfill = prior_snapshot.get("backfill_status", {}) or {}
+            source_stats = self.date_source_stats()
+            for source, label in (("ccdi", "中纪检"), ("bit", "校纪检")):
+                row = source_stats[source]
+                prior = prior_backfill.get(source) or {}
+                resumable = (
+                    row["missing"] > 0
+                    and str(prior.get("status") or "")
+                    in {"running", "error", "interrupted"}
+                    and bool(prior.get("next_page") or prior.get("page"))
+                )
+                if resumable:
+                    continue
+                self.state.set_backfill_status(
+                    source,
+                    status="done" if row["missing"] == 0 else "pending",
+                    current=row["dated"],
+                    total=row["total"],
+                    message=(
+                        f"{label}日期已完整"
+                        if row["missing"] == 0
+                        else f"{label}待补日期 {row['missing']} 条"
+                    ),
+                    persist=False,
+                )
+            status_before = self.state.get_version_index_status()
+            snapshot_now = self.state.snapshot()
+            has_index = bool(snapshot_now.get("version_index"))
+            source_index_docs = {
+                source: sum(
+                    1
+                    for record in (
+                        snapshot_now.get("version_records") or {}
+                    ).values()
+                    if isinstance(record, dict)
+                    and record.get("source") == source
+                )
+                for source in ("ccdi", "bit")
+            }
+            separate_indices = snapshot_now.get("version_indices") or {}
+            source_meta_before = status_before.get("sources") or {}
+
+            def source_index_present(source: str) -> bool:
+                return bool(separate_indices.get(source)) or source_index_docs[source] == 0
+
+            bit_index_needed = bool(
+                imported
+                or missing_bit
+                or not (source_meta_before.get("bit") or {}).get("ready")
+                or not source_index_present("bit")
+            )
+            ccdi_index_needed = bool(
+                imported
+                or missing_ccdi
+                or not (source_meta_before.get("ccdi") or {}).get("ready")
+                or not source_index_present("ccdi")
+            )
+            has_source_indexes = bool(
+                status_before.get("sources")
+                and all(
+                    isinstance(status_before["sources"].get(source), dict)
+                    and (
+                        bool((separate_indices.get(source) or {}))
+                        or source_index_docs[source] == 0
+                    )
+                    for source in ("ccdi", "bit")
+                )
+            )
+            needs_work = bool(
+                imported
+                or missing_ccdi
+                or missing_bit
+                or not status_before.get("ready")
+                or not has_index
+                or not has_source_indexes
+            )
+            if not needs_work:
+                self._index_ready = True
+                return {
+                    "ready": True,
+                    "building": False,
+                    "imported": 0,
+                    "message": "版本索引已就绪（日期完整，无需联网补录）",
+                }
+
+            if bit_index_needed:
+                self.state.mark_source_index_pending(
+                    "bit", "启动检查：校纪检索引需要补建"
+                )
+            if ccdi_index_needed:
+                self.state.mark_source_index_pending(
+                    "ccdi", "启动检查：中纪检索引需要补建"
+                )
+            self.state.set_progress(
+                "upload",
+                status="running",
+                current=0,
+                total=len(missing_ccdi) + len(missing_bit),
+                message=(
+                    "启动检查：正在补录文件日期"
+                    f"（中纪检 {len(missing_ccdi)}、校纪检 {len(missing_bit)}）…"
+                ),
+            )
+            crawl_cfg = self.config.get("crawl", {}) or {}
+            if missing_bit:
+                try:
+                    backfill_bit_publish_dates(
+                        self.state,
+                        rebuild_index=False,
+                        stop_event=self._stop_event,
+                        pause_event=self._pause_event,
+                    )
+                except Exception as exc:
+                    errors.append(f"校纪检日期补录失败：{exc}")
+                    source_errors["bit"] = str(exc)
+                    logger.exception("启动时补录校纪检日期失败")
+                    row = self.date_source_stats()["bit"]
+                    self.state.set_backfill_status(
+                        "bit",
+                        status="error",
+                        current=row["dated"],
+                        total=row["total"],
+                        message=f"校纪检日期补录失败：{exc}",
+                    )
+            filename_date_counts = self.state.fill_missing_dates_from_filenames(
+                ("ccdi", "bit"), rebuild_index=False
+            )
+            if any(filename_date_counts.values()):
+                logger.info(
+                    "文件名日期兜底：中纪检 %s 条，校纪检 %s 条",
+                    filename_date_counts.get("ccdi", 0),
+                    filename_date_counts.get("bit", 0),
+                )
+            _, missing_bit_after = self._missing_date_targets()
+            bit_index_result = {"ok": False}
+
+            def build_bit_index() -> None:
+                try:
+                    self.state.rebuild_source_version_index(
+                        "bit",
+                        ready=not missing_bit_after,
+                        reason=(
+                            "校纪检日期已补齐，版本索引已建立"
+                            if not missing_bit_after
+                            else f"校纪检日期仍缺 {len(missing_bit_after)} 条"
+                        ),
+                        error=source_errors["bit"],
+                    )
+                    bit_index_result["ok"] = True
+                except Exception as exc:
+                    source_errors["bit"] = str(exc)
+                    errors.append(f"校纪检版本索引建立失败：{exc}")
+                    logger.exception("校纪检版本索引建立失败")
+
+            # 校纪检日期处理完即开始建索引；中纪检继续联网补日期，两者并行。
+            # 如果校纪检索引上次已经完整建立，则保留它，不在重启时重做。
+            bit_index_thread = None
+            if bit_index_needed:
+                bit_index_thread = threading.Thread(
+                    target=build_bit_index,
+                    daemon=True,
+                    name="bit-version-index",
+                )
+                bit_index_thread.start()
+            else:
+                bit_index_result["ok"] = True
+            missing_ccdi, _ = self._missing_date_targets()
+            if missing_ccdi and not self._stop_event.is_set():
+                try:
+                    throttle_ranges = resolve_throttle_ranges(crawl_cfg)
+                    backfill_ccdi_publish_years(
+                        self.state,
+                        headless=bool(crawl_cfg.get("playwright_headless", True)),
+                        timeout_ms=int(
+                            crawl_cfg.get("page_load_timeout_ms", 120_000)
+                        ),
+                        browser_channel=crawl_cfg.get("browser_channel") or None,
+                        stealth=bool(crawl_cfg.get("stealth", True)),
+                        stop_event=self._stop_event,
+                        pause_event=self._pause_event,
+                        throttle_wait_ranges=throttle_ranges,
+                        throttle_max_rounds=resolve_throttle_rounds(
+                            crawl_cfg, default=len(throttle_ranges)
+                        ),
+                        rebuild_index_per_batch=False,
+                        request_delay_seconds=resolve_delay_range(crawl_cfg),
+                        force_full=False,
+                    )
+                except Exception as exc:
+                    errors.append(f"中纪检日期补录失败：{exc}")
+                    source_errors["ccdi"] = str(exc)
+                    logger.exception("启动时补录中纪检历史年份失败")
+                    row = self.date_source_stats()["ccdi"]
+                    self.state.set_backfill_status(
+                        "ccdi",
+                        status="error",
+                        current=row["dated"],
+                        total=row["total"],
+                        message=f"中纪检日期补录失败：{exc}",
+                    )
+
+            if bit_index_thread is not None:
+                bit_index_thread.join()
+            if bit_index_needed and not bit_index_result["ok"]:
+                try:
+                    self.state.rebuild_source_version_index(
+                        "bit",
+                        ready=False,
+                        error=source_errors["bit"],
+                        reason="校纪检版本索引建立失败",
+                    )
+                except Exception:
+                    logger.exception("重试建立校纪检版本索引失败")
+
+            # 联网补录结束后的第二次文件名兜底，覆盖本轮才暴露出的无日期文件。
+            filename_date_counts_after = self.state.fill_missing_dates_from_filenames(
+                ("ccdi",), rebuild_index=False
+            )
+            if filename_date_counts_after.get("ccdi"):
+                logger.info(
+                    "中纪检补录后文件名日期兜底：%s 条",
+                    filename_date_counts_after["ccdi"],
+                )
+            remaining_ccdi, remaining_bit = self._missing_date_targets()
+            if ccdi_index_needed:
+                try:
+                    self.state.rebuild_source_version_index(
+                        "ccdi",
+                        ready=not remaining_ccdi,
+                        reason=(
+                            "中纪检日期已补齐，版本索引已建立"
+                            if not remaining_ccdi
+                            else f"中纪检日期仍缺 {len(remaining_ccdi)} 条"
+                        ),
+                        error=source_errors["ccdi"],
+                    )
+                except Exception as exc:
+                    source_errors["ccdi"] = str(exc)
+                    errors.append(f"中纪检版本索引建立失败：{exc}")
+                    logger.exception("中纪检版本索引建立失败")
+
+            final_stats = self.date_source_stats()
+            ccdi_backfill = (
+                self.state.get_backfill_statuses().get("ccdi") or {}
+            )
+            for source, label in (("ccdi", "中纪检"), ("bit", "校纪检")):
+                row = final_stats[source]
+                ccdi_totals_complete = (
+                    source == "ccdi"
+                    and ccdi_backfill.get("status") == "done"
+                )
+                self.state.set_backfill_status(
+                    source,
+                    status=(
+                        "done"
+                        if row["missing"] == 0 or ccdi_totals_complete
+                        else "error"
+                    ),
+                    current=row["dated"],
+                    total=row["total"],
+                    message=(
+                        (
+                            f"{label}年份总数已全部获取；"
+                            f"文件名兜底后仍无日期 {row['missing']} 条"
+                        )
+                        if ccdi_totals_complete and row["missing"] > 0
+                        else f"{label}日期补录完成：{row['dated']}/{row['total']}"
+                        if row["missing"] == 0
+                        else (
+                            f"{label}日期仍缺 {row['missing']} 条："
+                            f"{row['dated']}/{row['total']}"
+                        )
+                    ),
+                    extra={"missing": row["missing"]},
+                    persist=False,
+                )
+            index_meta = self.state.get_version_index_status()
+            ready = bool(index_meta.get("ready"))
+            reason = (
+                "日期补录完成，最终版本索引已建立"
+                if ready
+                else (
+                    f"日期或索引未就绪：中纪检缺 {len(remaining_ccdi)}、"
+                    f"校纪检缺 {len(remaining_bit)}"
+                )
+            )
+            self._index_ready = ready
+            message = (
+                f"版本索引就绪：补登记 {imported} 个本地文件，"
+                "已按完整日期建立索引"
+                if ready
+                else f"{reason}；为保证版本判断准确，上传已暂停"
+            )
+            self.state.set_progress(
+                "upload",
+                status="idle" if ready else "error",
+                current=int(final_stats["ccdi"]["dated"]),
+                total=int(final_stats["ccdi"]["total"]),
+                message=message,
+            )
+            if ready:
+                self.state.clear_alert("version_index")
+            else:
+                detail = "；".join(errors)
+                self.state.set_alert(
+                    "version_index",
+                    message + (f"（{detail}）" if detail else ""),
+                    level="error",
+                )
+            logger.info(message)
+            return {
+                "ready": ready,
+                "building": False,
+                "imported": imported,
+                "missing_ccdi": len(remaining_ccdi),
+                "missing_bit": len(remaining_bit),
+                "errors": errors,
+                "message": message,
+            }
+        finally:
+            self._index_building = False
+
+    def _maintain_source(
+        self, source: str, *, force_full_dates: bool = False
+    ) -> None:
+        """单个来源：按需联网补日期，文件名兜底，再建立索引并置时效位。"""
+        flags = self.state.get_maintenance_flags()
+        if bool(flags.get(source)):
+            logger.info("%s时效标志为 true，沿用已有日期与索引", source)
+            return
+        stats_before = self.date_source_stats()[source]
+        needs_date_scan = bool(
+            stats_before["missing"] > 0
+            or (source == "ccdi" and force_full_dates)
+        )
+        if needs_date_scan:
+            self.state.reset_backfill_progress(source)
+            logger.info(
+                "%s开始新一轮日期补全：已清空 backfill_status 和旧断点",
+                source,
+            )
+        self.state.set_backfill_status(
+            source,
+            status="running",
+            current=stats_before["dated"],
+            total=stats_before["total"],
+            message=(
+                f"扫描 crawler_state：{stats_before['dated']}/"
+                f"{stats_before['total']} 条已有日期"
+            ),
+        )
+        if needs_date_scan:
+            crawl_cfg = self.config.get("crawl", {}) or {}
+            if source == "ccdi":
+                throttle_ranges = resolve_throttle_ranges(crawl_cfg)
+                backfill_ccdi_publish_years(
+                    self.state,
+                    headless=bool(crawl_cfg.get("playwright_headless", True)),
+                    timeout_ms=int(
+                        crawl_cfg.get("page_load_timeout_ms", 120_000)
+                    ),
+                    browser_channel=crawl_cfg.get("browser_channel") or None,
+                    stealth=bool(crawl_cfg.get("stealth", True)),
+                    stop_event=self._stop_event,
+                    pause_event=self._pause_event,
+                    throttle_wait_ranges=throttle_ranges,
+                    throttle_max_rounds=resolve_throttle_rounds(
+                        crawl_cfg, default=len(throttle_ranges)
+                    ),
+                    rebuild_index_per_batch=False,
+                    request_delay_seconds=resolve_delay_range(crawl_cfg),
+                    force_full=force_full_dates,
+                )
+            else:
+                backfill_bit_publish_dates(
+                    self.state,
+                    rebuild_index=False,
+                    stop_event=self._stop_event,
+                    pause_event=self._pause_event,
+                )
+        match_audit: dict | None = None
+        if source == "ccdi":
+            # 不能只看页面“匹配到了”：必须回到 documents 核对匹配编号对应的
+            # ccdi:<N> 是否真的写入了 publish_date，并检查跨年份重复编号。
+            match_audit = audit_ccdi_match_dates(self.state, repair=True)
+            self.state.set_backfill_status(
+                "ccdi",
+                extra={"match_audit": match_audit},
+            )
+            if force_full_dates and not match_audit.get("audit_complete"):
+                raise RuntimeError(
+                    "中纪检强制重扫后仍有年份缺少逐页编号审计，"
+                    "无法证明网页编号没有跨年重复"
+                )
+            if not match_audit.get("consistent"):
+                raise RuntimeError(
+                    "中纪检编号/日期一致性校验失败："
+                    f"跨年重复 {match_audit['repeated_count']}，"
+                    f"同年跨页重复 "
+                    f"{match_audit['same_year_repeated_count']}，"
+                    f"未匹配 {match_audit['unmatched_count']}，"
+                    f"匹配但缺日期 "
+                    f"{match_audit['matched_missing_date_count']}，"
+                    f"日期年份不符 "
+                    f"{match_audit['matched_wrong_year_count']}"
+                )
+        # 联网补录后仍无日期的文件，按文件名年份兜底。
+        self.state.fill_missing_dates_from_filenames(
+            (source,), rebuild_index=False
+        )
+        stats_after = self.date_source_stats()[source]
+        backfill_row = (
+            self.state.get_backfill_statuses().get(source) or {}
+        )
+        if source == "bit" and stats_after["missing"] > 0:
+            raise RuntimeError(
+                f"校纪检仍有 {stats_after['missing']} 条文件没有日期"
+            )
+        if (
+            source == "ccdi"
+            and stats_after["missing"] > 0
+            and backfill_row.get("status") != "done"
+        ):
+            raise RuntimeError(
+                "中纪检年份总数尚未全部获取，日期补全未完成"
+            )
+        self.state.rebuild_source_version_index(
+            source,
+            ready=True,
+            reason=(
+                f"日期补全完成（{stats_after['dated']}/{stats_after['total']}）"
+                "，版本索引已建立"
+            ),
+            require_all_dates=False,
+        )
+        index_meta = self.state.get_version_index_status()
+        source_ready = bool(
+            ((index_meta.get("sources") or {}).get(source) or {}).get("ready")
+        )
+        if not source_ready:
+            raise RuntimeError(f"{source} 版本索引建立后仍未就绪")
+        self.state.set_backfill_status(
+            source,
+            status="done",
+            current=stats_after["dated"],
+            total=stats_after["total"],
+            message=(
+                f"日期补全与索引完成：{stats_after['dated']}/"
+                f"{stats_after['total']} 条已有日期"
+            ),
+            extra={
+                key: value
+                for key, value in backfill_row.items()
+                if key
+                not in {
+                    "status",
+                    "current",
+                    "total",
+                    "message",
+                    "updated_at",
+                }
+            },
+        )
+        self.state.set_maintenance_flag(source, True)
+
+    def run_date_index_maintenance(
+        self,
+        sources: list[str] | tuple[str, ...] = ("ccdi", "bit"),
+        *,
+        force_full_dates: bool = False,
+    ) -> dict[str, bool]:
+        """并行执行各来源日期补全和索引建立；true 的来源直接沿用。"""
+        requested = [source for source in sources if source in ("ccdi", "bit")]
+        if not requested:
+            return {"ccdi": True, "bit": True}
+        if self._index_building:
+            raise RuntimeError("日期补全/索引建立正在进行")
+        self._index_building = True
+        outcomes: dict[str, bool] = {}
+        errors: dict[str, str] = {}
+
+        def worker(source: str) -> None:
+            try:
+                self._maintain_source(
+                    source,
+                    force_full_dates=force_full_dates and source == "ccdi",
+                )
+                outcomes[source] = True
+            except Exception as exc:
+                errors[source] = str(exc)
+                outcomes[source] = False
+                logger.exception("%s 日期/索引维护失败", source)
+                self.state.set_maintenance_flag(source, False)
+                row = self.date_source_stats()[source]
+                self.state.set_backfill_status(
+                    source,
+                    status="error",
+                    current=row["dated"],
+                    total=row["total"],
+                    message=f"日期或索引维护失败：{exc}",
+                )
+                try:
+                    self.state.rebuild_source_version_index(
+                        source,
+                        ready=False,
+                        reason="日期补全或索引建立失败",
+                        error=str(exc),
+                        require_all_dates=False,
+                    )
+                except Exception:
+                    logger.exception("%s 错误状态写入索引元数据失败", source)
+
+        try:
+            threads = [
+                threading.Thread(
+                    target=worker,
+                    args=(source,),
+                    daemon=True,
+                    name=f"maintenance-{source}",
+                )
+                for source in requested
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        finally:
+            self._index_building = False
+        flags = self.state.get_maintenance_flags()
+        self._index_ready = all(
+            bool(flags.get(source)) for source in ("ccdi", "bit")
+        )
+        return {
+            "ccdi": bool(flags.get("ccdi")),
+            "bit": bool(flags.get("bit")),
+            "errors": errors,
+        }
+
+    def _post_crawl_maintenance_and_upload(
+        self, source: str, *, was_first_run: bool
+    ) -> None:
+        """爬取后：有更新才置 false，补日期/索引完成后再上传。"""
+        flags = self.state.get_maintenance_flags()
+        targets: list[str] = []
+        if was_first_run:
+            self.state.set_all_maintenance_flags(False)
+            targets = ["ccdi", "bit"]
+        else:
+            for item in ("ccdi", "bit"):
+                if self._last_crawl_results.get(item, 0) > 0:
+                    self.state.set_maintenance_flag(item, False)
+                    targets.append(item)
+                elif not flags.get(item):
+                    targets.append(item)
+            targets = sorted(set(targets))
+        if self._stop_event.is_set():
+            return
+        if not targets:
+            logger.info("本轮爬取无更新，时效标志保持不变，不执行日期补全、索引和上传")
+            return
+        result = self.run_date_index_maintenance(
+            tuple(targets), force_full_dates=was_first_run
+        )
+        if not all(
+            bool(self.state.get_maintenance_flags().get(item))
+            for item in ("ccdi", "bit")
+        ):
+            logger.error(
+                "日期/索引维护未完成，跳过上传：%s", result.get("errors") or result
+            )
+            return
+        if self.upload_mode != "auto":
+            logger.info("日期补全和版本索引已完成；上传方式为手动，等待用户上传")
+            return
+        logger.info("日期补全和版本索引已完成，开始上传最新版本")
+        self.upload_now_sync()
 
     def _upload_pass(self, stop_event: threading.Event | None = None) -> None:
         """执行一次“立即上传”（跳过已上传的），供首次运行的批量上传循环调用。"""
-        if self._upload_running:
+        if (
+            self._upload_running
+            or self._migration_running
+            or self._index_building
+            or not self._version_index_is_ready()
+        ):
             return
         self._upload_running = True
         try:
@@ -970,7 +1762,12 @@ class JobController:
         若此刻已有任务在跑（例如首次全量爬取还没结束），本次时间点**直接跳过、
         不排队也不补跑**，等下一个定时点；「首次执行」标记也保持不变。
         """
-        if self._crawl_running or self._upload_running:
+        if (
+            self._crawl_running
+            or self._upload_running
+            or self._migration_running
+            or self._index_building
+        ):
             logger.warning("定时爬取跳过：已有任务运行中（这个时间点不再补跑，等下一天）")
             return
         source = self.test_source if self.mode == "test" else "all"
@@ -981,11 +1778,17 @@ class JobController:
 
         到点时如果爬取还没结束，上传会与爬取并行启动（不再整体跳过）。
         """
-        if self._upload_running:
-            logger.warning("定时上传跳过：已有上传任务在运行")
+        if (
+            self._upload_running
+            or self._migration_running
+            or self._index_building
+            or self._crawl_running
+        ):
+            logger.warning("定时上传跳过：爬取、维护或上传任务正在运行")
             return
-        if self._crawl_running:
-            logger.info("定时上传：爬取仍在进行，上传将与爬取并行执行")
+        if not self._version_index_is_ready():
+            logger.warning("定时上传跳过：版本索引未就绪")
+            return
         # 测试模式的「间隔（分钟）」上传不走这里（由 _interval_loop 直接触发），
         # 所以到这里的是：运行模式，或测试模式的「按每日时间点」。
         if self._upload_strategy() == "interval":
@@ -1077,7 +1880,12 @@ class JobController:
 
     def set_output_dir(self, value: str) -> dict:
         """切换 PDF 输出目录，并加载新目录下的状态文件。"""
-        if self._crawl_running or self._upload_running:
+        if (
+            self._crawl_running
+            or self._upload_running
+            or self._migration_running
+            or self._index_building
+        ):
             raise RuntimeError("已有任务运行中，无法修改保存位置")
         value = (value or "").strip()
         if not value:
@@ -1097,10 +1905,11 @@ class JobController:
         pause_event: threading.Event | None = None,
         parallel: bool = False,
         categories: list[str] | None = None,
-    ) -> None:
+    ) -> dict[str, int]:
         self._begin_run_log()
+        self._last_crawl_results = {"ccdi": 0, "bit": 0}
         try:
-            run_crawl_jobs(
+            results = run_crawl_jobs(
                 self.state,
                 self.config,
                 source=source,
@@ -1111,6 +1920,11 @@ class JobController:
                 categories=categories,
                 retry_probe=self._retry_probe,
             )
+            self._last_crawl_results = {
+                "ccdi": int((results or {}).get("ccdi", 0)),
+                "bit": int((results or {}).get("bit", 0)),
+            }
+            return self._last_crawl_results
         finally:
             self._end_run_log()
 
@@ -1164,6 +1978,7 @@ class JobController:
         stop_event: threading.Event | None,
         pause_event: threading.Event | None = None,
     ) -> None:
+        self.state.clear_alert("upload_error")
         run_upload_jobs(
             self.state,
             self.config,
@@ -1174,9 +1989,17 @@ class JobController:
 
     def crawl_sync(self, source: str = "all", max_items: int | None = None) -> None:
         """同步执行爬取（定时任务 / 首次运行 / 命令行用）。"""
-        if self._crawl_running or self._upload_running:
+        if (
+            self._crawl_running
+            or self._upload_running
+            or self._migration_running
+            or self._index_building
+        ):
             logger.warning("爬取跳过：已有任务运行中")
             return
+        first_time = self.state.is_first_run() or not bool(
+            self.state.snapshot().get("documents")
+        )
         self._stop_event.clear()
         self._pause_event.clear()
         self._crawl_running = True
@@ -1187,6 +2010,10 @@ class JobController:
         finally:
             self._crawl_running = False
         self._after_crawl(source)
+        if not self._stop_event.is_set():
+            self._post_crawl_maintenance_and_upload(
+                source, was_first_run=first_time
+            )
 
     def _after_crawl(self, source: str) -> None:
         """一轮爬取结束后的收尾：安排跳过分类重试、判断首次运行是否完成。"""
@@ -1273,6 +2100,9 @@ class JobController:
         )
 
     def next_throttle_retry_at(self) -> str | None:
+        throttle = self.state.get_throttle_state("ccdi") or {}
+        if throttle.get("context") == "date_backfill":
+            return None
         if self._scheduler is None:
             return None
         job = self._scheduler.get_job(THROTTLE_RETRY_JOB_ID)
@@ -1327,7 +2157,7 @@ class JobController:
 
     def retry_throttled_ccdi(self) -> None:
         """定时触发：限流结束后的自动重试（从中纪检断点续爬）。"""
-        if self._crawl_running or self._upload_running:
+        if self._crawl_running or self._upload_running or self._migration_running:
             logger.warning("限流自动重试推迟：当前有任务运行中，10 分钟后再试")
             self.schedule_throttle_retry(minutes=10)
             return
@@ -1503,7 +2333,7 @@ class JobController:
         if not ids:
             self.cancel_failed_retry()
             return
-        if self._crawl_running or self._upload_running:
+        if self._crawl_running or self._upload_running or self._migration_running:
             # 抢占式：让正在爬取的主循环在下个编号前插入失败编号重试
             logger.info("失败编号重试：通知正在运行的主扫描插队处理")
             self._retry_interrupt.set()
@@ -1532,10 +2362,6 @@ class JobController:
 
     def _run_failed_retry_blocking(self, ids: list[int]) -> None:
         was_first = self.state.is_first_run()
-        # 首次运行期间：重试也走「边爬边每 15 秒批量上传」
-        batch_done = None
-        if was_first and self.upload_mode == "auto":
-            batch_done = self.start_first_run_uploader()
         self._stop_event.clear()
         self._pause_event.clear()
         self._crawl_running = True
@@ -1552,23 +2378,19 @@ class JobController:
             logger.exception("失败编号重试任务异常")
         finally:
             self._crawl_running = False
-            if batch_done is not None:
-                batch_done.set()
-        # 重试也可能补齐「首次运行」的最后一条：走一遍收尾并补上传
+        # 重试补充了新文件时，同样先补日期、建索引，再上传。
         self._after_crawl("ccdi")
-        if was_first and not self.state.is_first_run() and self.upload_mode == "auto":
-            logger.info("首次运行已通过失败重试补齐，立即上传全部文件")
-            try:
-                self.upload_now_sync()
-            except Exception:
-                logger.exception("补齐后的自动上传失败")
+        if not self._stop_event.is_set():
+            self._post_crawl_maintenance_and_upload(
+                "ccdi", was_first_run=was_first
+            )
 
     def start_failed_retry_now(self) -> dict:
         """UI「重试失败编号」：立即异步重试，结束后重新安排 30 分钟后的下一次。"""
         ids = self._failed_ids()
         if not ids:
             raise RuntimeError("当前没有失败编号")
-        if self._crawl_running or self._upload_running:
+        if self._crawl_running or self._upload_running or self._migration_running:
             # 抢占式：不另起任务，让主循环插队重试，重试完自动回到原编号
             self._retry_interrupt.set()
             logger.info("已通知正在运行的主扫描：插入失败编号重试")
@@ -1577,9 +2399,6 @@ class JobController:
 
         def worker() -> None:
             was_first = self.state.is_first_run()
-            batch_done = None
-            if was_first and self.upload_mode == "auto":
-                batch_done = self.start_first_run_uploader()
             self._crawl_running = True
             try:
                 run_crawl_jobs(
@@ -1594,19 +2413,11 @@ class JobController:
                 logger.exception("手动重试失败编号异常")
             finally:
                 self._crawl_running = False
-                if batch_done is not None:
-                    batch_done.set()
             self._after_crawl("ccdi")
-            if (
-                was_first
-                and not self.state.is_first_run()
-                and self.upload_mode == "auto"
-            ):
-                logger.info("首次运行已通过手动重试补齐，立即上传全部文件")
-                try:
-                    self.upload_now_sync()
-                except Exception:
-                    logger.exception("补齐后的自动上传失败")
+            if not self._stop_event.is_set():
+                self._post_crawl_maintenance_and_upload(
+                    "ccdi", was_first_run=was_first
+                )
             remaining = self._failed_ids()
             if not remaining:
                 self._failed_round = 0
@@ -1622,8 +2433,16 @@ class JobController:
 
     def upload_sync(self) -> None:
         """同步执行定时上传（按保留天数）。"""
-        if self._upload_running or self._crawl_running:
+        if (
+            self._upload_running
+            or self._crawl_running
+            or self._migration_running
+            or self._index_building
+        ):
             logger.warning("上传跳过：已有任务运行中")
+            return
+        if not self._version_index_is_ready():
+            logger.warning("上传跳过：版本索引尚未就绪")
             return
         self._stop_event.clear()
         self._pause_event.clear()
@@ -1635,8 +2454,16 @@ class JobController:
 
     def upload_now_sync(self) -> None:
         """同步执行立即上传（首次运行 / 命令行用）。"""
-        if self._upload_running or self._crawl_running:
+        if (
+            self._upload_running
+            or self._crawl_running
+            or self._migration_running
+            or self._index_building
+        ):
             logger.warning("立即上传跳过：已有任务运行中")
+            return
+        if not self._version_index_is_ready():
+            logger.warning("立即上传跳过：版本索引尚未就绪")
             return
         self._stop_event.clear()
         self._pause_event.clear()
@@ -1674,10 +2501,6 @@ class JobController:
         self._stop_event.clear()
         self._pause_event.clear()
         self._crawl_running = True
-        # 首次采集：一边爬一边批量上传，避免上传环节空等
-        batch_done = None
-        if first_time and self.upload_mode == "auto":
-            batch_done = self.start_first_run_uploader()
         try:
             self._crawl_blocking(
                 source, max_items, self._stop_event, self._pause_event, self.parallel
@@ -1686,59 +2509,35 @@ class JobController:
             logger.exception("爬取失败")
         finally:
             self._crawl_running = False
-            if batch_done is not None:
-                batch_done.set()
         # 本次爬取若跳过了中纪检子分类，按配置的间隔安排自动重试
         self._after_crawl(source)
-        if batch_done is not None:
-            logger.info("首次采集：并行批量上传已接管，爬取结束后由上传线程收尾")
-            return
         if self._stop_event.is_set():
-            logger.info("爬取已终止，跳过自动上传")
+            logger.info("爬取已终止，跳过日期补全、索引和上传")
             return
-        if self.upload_mode != "auto":
-            return
-        strategy = self._upload_strategy()
-        interval_days = self._upload_interval_days()
-        if not first_time and strategy == "interval":
-            if interval_days > 0:
-                logger.info(
-                    "自动上传：每 %s 天统一上传，本次爬取结束后不立即上传"
-                    "（到点由定时任务一次性上传全部未上传文件）",
-                    interval_days,
-                )
-                return
-            logger.info(
-                "自动上传：上传间隔设为 0，随爬取立即上传全部未上传文件"
-            )
-        if not first_time and strategy == "age" and self._upload_schedule_configured():
-            upload_at = self.config.get("schedule", {}).get("upload_time")
-            if not self._upload_time_passed_today():
-                logger.info(
-                    "自动上传：本次等待设定的上传时间点（%s）由定时任务执行", upload_at
-                )
-                return
-            logger.info(
-                "自动上传：今天的上传时间点（%s）已过，本次爬取结束后立即上传", upload_at
-            )
-        if async_upload:
-            try:
-                self.start_upload()
-            except RuntimeError:
-                logger.warning("自动上传未启动：已有任务运行中")
-        else:
-            self.upload_now_sync()
+        self._post_crawl_maintenance_and_upload(
+            source, was_first_run=first_time
+        )
 
     def crawl_now_sync(self, source: str = "all") -> None:
         """命令行 --crawl-now：同步跑一次，行为与界面点「开始」一致。"""
-        if self._crawl_running or self._upload_running:
+        if (
+            self._crawl_running
+            or self._upload_running
+            or self._migration_running
+            or self._index_building
+        ):
             logger.warning("爬取跳过：已有任务运行中")
             return
         self._run_crawl_with_upload(source, async_upload=False)
 
     def start_crawl(self, source: str = "all") -> dict:
         """UI 触发：异步执行爬取；结束后按设置决定是否自动上传。"""
-        if self._crawl_running or self._upload_running:
+        if (
+            self._crawl_running
+            or self._upload_running
+            or self._migration_running
+            or self._index_building
+        ):
             raise RuntimeError("已有任务运行中")
         max_items = self._max_items_for_mode()
         # 线程真正开始前就把标志置上：否则界面在启动的瞬间仍认为空闲，
@@ -1769,8 +2568,15 @@ class JobController:
         allow_during_crawl=True 时允许与爬取并行——定时上传到点就要传，
         不能因为爬取还没结束就整体跳过。
         """
-        if self._upload_running or (self._crawl_running and not allow_during_crawl):
+        if (
+            self._upload_running
+            or self._migration_running
+            or self._index_building
+            or (self._crawl_running and not allow_during_crawl)
+        ):
             raise RuntimeError("已有任务运行中")
+        if not self._version_index_is_ready():
+            raise RuntimeError("版本索引尚未就绪，暂时不能上传")
         if not self._crawl_running:
             # 爬取在跑时不要动这两个事件，否则会把用户暂停的任务"顺带"继续
             self._stop_event.clear()
@@ -1782,8 +2588,15 @@ class JobController:
         def worker() -> None:
             try:
                 self._upload_blocking(immediate, self._stop_event, self._pause_event)
-            except Exception:
+            except Exception as exc:
                 logger.exception("UI 触发的上传失败")
+                reason = f"{type(exc).__name__}: {exc}".replace("\n", " ")[:400]
+                self.state.set_progress(
+                    "upload", status="error", message=f"上传异常：{reason}"
+                )
+                self.state.set_alert(
+                    "upload_error", f"上传异常中断：{reason}", level="error"
+                )
             finally:
                 self._upload_running = False
 
@@ -1795,7 +2608,12 @@ class JobController:
         self.cancel_skipped_retry(reason="已终止所有任务")
         self.cancel_throttle_retry(reason="已终止所有任务")
         self.cancel_failed_retry()
-        if not (self._crawl_running or self._upload_running):
+        if not (
+            self._crawl_running
+            or self._upload_running
+            or self._migration_running
+            or self._index_building
+        ):
             self._pause_event.clear()
             # 状态文件仍显示运行中，说明任务在别的进程里（例如终端单次任务），
             # 本界面改不了它的停止标志，给出明确提示而不是一句"没有任务"。
@@ -1826,14 +2644,24 @@ class JobController:
 
     def pause(self) -> dict:
         """暂停当前运行中的任务。"""
-        if not (self._crawl_running or self._upload_running):
+        if not (
+            self._crawl_running
+            or self._upload_running
+            or self._migration_running
+            or self._index_building
+        ):
             return {"paused": False, "message": "当前没有运行中的任务"}
         self._pause_event.set()
         return {"paused": True, "message": "任务已暂停"}
 
     def resume(self) -> dict:
         """继续已暂停的任务。"""
-        if not (self._crawl_running or self._upload_running):
+        if not (
+            self._crawl_running
+            or self._upload_running
+            or self._migration_running
+            or self._index_building
+        ):
             return {"paused": False, "message": "当前没有运行中的任务"}
         self._pause_event.clear()
         return {"paused": False, "message": "任务已继续"}
@@ -1920,7 +2748,7 @@ class JobController:
         if not codes:
             self.cancel_skipped_retry()
             return
-        if self._crawl_running or self._upload_running:
+        if self._crawl_running or self._upload_running or self._migration_running:
             logger.info("跳过分类重试延后：当前有任务运行中，%s 分钟后再试", self._skipped_retry_minutes())
             self.schedule_skipped_retry()
             return
@@ -1972,20 +2800,137 @@ class JobController:
             now = datetime.now()
             if self._next_crawl_at and now >= self._next_crawl_at:
                 self._next_crawl_at = self._compute_next(self.crawl_interval_minutes)
-                if not (self._crawl_running or self._upload_running):
+                if not (
+                    self._crawl_running
+                    or self._upload_running
+                    or self._migration_running
+                    or self._index_building
+                ):
                     logger.info("测试模式间隔触发：开始爬取（%s）", self.test_source)
                     self.crawl_sync(
                         source=self.test_source, max_items=self._max_items_for_mode()
                     )
             if self._next_upload_at and now >= self._next_upload_at:
                 self._next_upload_at = self._compute_next(self.upload_interval_minutes)
-                if not (self._crawl_running or self._upload_running):
+                if not (
+                    self._crawl_running
+                    or self._upload_running
+                    or self._migration_running
+                    or self._index_building
+                ):
                     logger.info("测试模式间隔触发：开始上传")
                     self.upload_now_sync()
 
     def agent_status(self) -> dict:
         """查询学科智能体连接状态与两个知识库的文档状态统计。"""
-        return get_agent_status(self.config)
+        return get_agent_status(self.config, self.state)
+
+    def _persist_dataset_ids(self, ccdi_id: str, bit_id: str) -> None:
+        rag = self.config.setdefault("ragflow", {})
+        rag["dataset_id_ccdi"] = ccdi_id
+        rag["dataset_id_bit"] = bit_id
+        if self.config_path:
+            try:
+                _update_ragflow_in_config(
+                    self.config_path,
+                    {"dataset_id_ccdi": ccdi_id, "dataset_id_bit": bit_id},
+                )
+            except OSError as exc:
+                logger.warning(
+                    "新库 ID 已保存到内存，但写回 config.yaml 失败：%s", exc
+                )
+
+    def _migration_blocking(self) -> None:
+        """迁库后台任务：确认日期与最终索引就绪后再重建并上传。"""
+        rag_cfg = self.config.get("ragflow", {}) or {}
+        if not rag_cfg.get("base_url") or not rag_cfg.get("api_key"):
+            raise RuntimeError("未配置学科智能体地址或 API Key")
+        prepared = self.prepare_version_index_on_startup()
+        if not prepared.get("ready"):
+            raise RuntimeError(
+                prepared.get("message")
+                or "日期或版本索引尚未就绪，已停止迁库"
+            )
+        if self._stop_event.is_set():
+            raise RuntimeError("迁库准备已终止，原知识库未删除")
+        uploader = RagflowKbUploader(
+            str(rag_cfg.get("base_url") or ""),
+            str(rag_cfg.get("api_key") or ""),
+        )
+        result = migrate_dataset_libraries(
+            self.state,
+            self.config,
+            uploader,
+            stop_event=self._stop_event,
+            pause_event=self._pause_event,
+            dataset_created_callback=self._persist_dataset_ids,
+        )
+        if result.get("stopped"):
+            message = "新库已创建，但重新上传已终止；点击「立即上传」可继续"
+            self.state.set_progress("upload", status="idle", message=message)
+            self.state.set_alert(
+                "dataset_migration", message, level="warning"
+            )
+            logger.warning(message)
+            return
+        message = (
+            "迁库完成：中纪检 {} 条、校纪检 {} 条最新文件已重新上传".format(
+                result.get("uploaded", {}).get("ccdi", 0),
+                result.get("uploaded", {}).get("bit", 0),
+            )
+        )
+        self.state.set_progress(
+            "upload", status="idle", message=message
+        )
+        self.state.clear_alert("dataset_migration")
+        logger.info(message)
+
+    def start_dataset_migration(self) -> dict:
+        """UI 二次确认后触发迁库；与爬取、上传、定时上传互斥。"""
+        if (
+            self._crawl_running
+            or self._upload_running
+            or self._migration_running
+            or self._index_building
+        ):
+            raise RuntimeError("已有任务运行中，无法迁库")
+        self.state.reload()
+        progress = self.state.snapshot().get("progress") or {}
+        if any(
+            (progress.get(key) or {}).get("status") == "running"
+            for key in ("ccdi", "bit", "upload")
+        ):
+            raise RuntimeError("状态文件显示仍有任务运行中，无法迁库")
+        self._stop_event.clear()
+        self._pause_event.clear()
+        self._migration_running = True
+
+        def worker() -> None:
+            try:
+                self._migration_blocking()
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {exc}".replace("\n", " ")[:400]
+                logger.exception("迁库失败")
+                self.state.set_dataset_migration(
+                    status="error",
+                    error=reason,
+                    finished_at=datetime.now().isoformat(),
+                )
+                self.state.set_progress(
+                    "upload", status="error", message=f"迁库失败：{reason}"
+                )
+                self.state.set_alert(
+                    "dataset_migration",
+                    f"迁库失败：{reason}",
+                    level="error",
+                )
+            finally:
+                self._migration_running = False
+
+        threading.Thread(
+            target=worker, daemon=True, name="dataset-migration"
+        ).start()
+        return {"started": True, "message": "迁库任务已启动"}
 
     def set_agent_config(
         self,
@@ -1996,13 +2941,23 @@ class JobController:
         dataset_name_bit: str,
     ) -> dict:
         """修改学科智能体地址、API Key 与两个库名称，并写回配置文件。"""
-        if self._crawl_running or self._upload_running:
+        if self._crawl_running or self._upload_running or self._migration_running:
             raise RuntimeError("已有任务运行中，无法修改学科智能体配置")
         rag = self.config.setdefault("ragflow", {})
+        old_base_url = str(rag.get("base_url") or "").rstrip("/")
+        old_names = (rag.get("dataset_name_ccdi"), rag.get("dataset_name_bit"))
         rag["base_url"] = (base_url or "").strip().rstrip("/")
         rag["api_key"] = (api_key or "").strip()
         rag["dataset_name_ccdi"] = (dataset_name_ccdi or "").strip() or "中纪检"
         rag["dataset_name_bit"] = (dataset_name_bit or "").strip() or "校纪检"
+        # 库名变了就不能继续沿用旧库 ID，否则上传会写进原库。
+        if (
+            old_base_url != rag["base_url"]
+            or old_names[0] != rag["dataset_name_ccdi"]
+            or old_names[1] != rag["dataset_name_bit"]
+        ):
+            rag["dataset_id_ccdi"] = ""
+            rag["dataset_id_bit"] = ""
         if self.config_path:
             _update_ragflow_in_config(
                 self.config_path,
@@ -2011,6 +2966,8 @@ class JobController:
                     "api_key": rag["api_key"],
                     "dataset_name_ccdi": rag["dataset_name_ccdi"],
                     "dataset_name_bit": rag["dataset_name_bit"],
+                    "dataset_id_ccdi": rag.get("dataset_id_ccdi", ""),
+                    "dataset_id_bit": rag.get("dataset_id_bit", ""),
                 },
             )
         return {"saved": True}
@@ -2076,7 +3033,6 @@ def main() -> None:
     controller = JobController(state, config)
     controller.config_path = config_path
     _install_signal_handlers(controller)
-    controller.start_interval_scheduler()
 
     # 实例自检：同一输出目录若还有旧进程活着，界面很可能会端口冲突、看到旧状态
     pid_file = output_dir / ".crawler.pid"
@@ -2102,6 +3058,9 @@ def main() -> None:
     except OSError as exc:
         logger.warning("写入 PID 文件失败（不影响运行）：%s", exc)
 
+    # 先保留磁盘上的重跑意图。启动对账可能因“总数已齐”清除 first_run_pending，
+    # 但这一次 reload 仍须按首次运行强制执行完整年份扫描。
+    first_run_requested = state.is_first_run()
     # 首次运行标记：一旦开始就持久化，只有整轮爬完（两个来源都跑完）才清除。
     # 所以首次运行中途被中断，重启后仍然按"首次运行"继续。
     # 启动先对账：两个来源都已经齐全时，直接清掉首次执行标记与续爬/重试状态。
@@ -2150,29 +3109,35 @@ def main() -> None:
             monitor_cfg.get("port", 8765),
         )
 
-    # 定时任务先注册：首次全量 / --crawl-now 可能要跑很久，
-    # 这样到点的上传仍能按计划触发（上传与爬取并行）。
+    controller.start_interval_scheduler()
     scheduler = None
-    # 只要开着监控界面就启动定时任务：界面里可以配置每日时间点，
-    # 若这里悄悄跳过，就会出现“设了时间却不执行”的困惑。
-    # 只有 --no-schedule 且 --no-ui（纯单次执行）时才不注册定时任务。
     if not args.no_schedule or not args.no_ui:
         scheduler = start_scheduler(state, config, controller)
     else:
         logger.info("已跳过定时任务（--no-schedule --no-ui：单次执行模式）")
 
+    # 首次全量运行必须先完成爬取，再进入日期补全、索引和上传。
+    defer_maintenance = first_run and not args.no_auto_start
+    if defer_maintenance:
+        flags = state.get_maintenance_flags()
+        index_ready = all(bool(flags.get(k)) for k in ("ccdi", "bit"))
+        logger.info("首次运行：日期补全与索引将在全量爬取完成后自动执行")
+    else:
+        index_result = controller.prepare_version_index_on_startup(
+            force_full_dates=first_run_requested
+        )
+        index_ready = bool(index_result.get("ready"))
+        if not index_ready:
+            logger.error("启动索引准备未完成：%s", index_result.get("message"))
+
     ran_work = False
     try:
-        if first_run and not args.no_auto_start:
-            logger.info("首次运行：全量爬取（边爬边批量上传），结束后收尾上传")
+        if not index_ready and not defer_maintenance:
+            logger.error("版本索引未就绪，本次启动跳过自动爬取与上传")
+        elif first_run and not args.no_auto_start:
+            logger.info("首次运行：全量爬取，结束后补日期、建索引并上传")
             controller.mark_first_run(True)
-            batch_done = controller.start_first_run_uploader()
-            try:
-                controller.crawl_sync()
-            except Exception:
-                logger.exception("首次全量爬取失败")
-            finally:
-                batch_done.set()
+            controller.crawl_sync()
             ran_work = True
         else:
             if args.crawl_now:
